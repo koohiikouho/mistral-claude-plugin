@@ -1,0 +1,4 @@
+mistral-claude-plugin
+This project's command layout and job model are modeled on openai/codex-plugin-cc
+(Copyright 2026 OpenAI, Apache License 2.0): https://github.com/openai/codex-plugin-cc
+Licensed under the Apache License, Version 2.0; see LICENSE.

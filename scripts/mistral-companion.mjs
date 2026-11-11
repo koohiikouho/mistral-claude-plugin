@@ -333,7 +333,7 @@ function collectReviewContext(cwd, { scope, base }) {
 function loadPrompt(name) { return fs.readFileSync(path.join(ROOT, "prompts", `${name}.md`), "utf8"); }
 
 async function cmdReview(argv, adversarial) {
-  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["base", "scope", "model", "max-turns", "time-limit"], boolFlags: ["wait", "background", "json", "full"] });
+  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["base", "scope", "model", "max-turns", "time-limit"], boolFlags: ["wait", "background", "json", "brief"] });
   const cwd = process.cwd();
   if (!git(["rev-parse", "--is-inside-work-tree"], cwd).ok) { console.error("Not inside a git repository."); return 1; }
   let ctx;
@@ -345,9 +345,9 @@ async function cmdReview(argv, adversarial) {
   const prompt = loadPrompt(adversarial ? "adversarial-review" : "review")
     .replace("{{TARGET}}", () => ctx.target)
     .replace("{{FOCUS}}", () => focus || "(none)")
-    .replace("{{CONTEXT}}", () => ctx.body) + (opts.full ? "" : BRIEF_REVIEW_NOTE);
+    .replace("{{CONTEXT}}", () => ctx.body) + (opts.brief ? BRIEF_REVIEW_NOTE : "");
   return runJob({ kind: adversarial ? "adversarial-review" : "review", title: `${adversarial ? "Adversarial review" : "Review"}: ${ctx.target}`,
-    cwd, prompt, write: false, model: opts.model, maxTurns: num(opts["max-turns"]) || DEFAULT_REVIEW_TURNS, timeLimit: num(opts["time-limit"]), json: opts.json, brief: !opts.full });
+    cwd, prompt, write: false, model: opts.model, maxTurns: num(opts["max-turns"]) || DEFAULT_REVIEW_TURNS, timeLimit: num(opts["time-limit"]), json: opts.json, brief: !!opts.brief });
 }
 const BRIEF_REVIEW_NOTE = [
   "", "", "## Brevity (token budget)",

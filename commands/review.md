@@ -1,6 +1,6 @@
 ---
 description: Run a Mistral Vibe code review against local git state
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <alias>] [--full]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <alias>] [--brief]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
@@ -14,7 +14,7 @@ Rules (keep this turn cheap):
 - Review-only. Do not fix issues, apply patches, or run any other command first (no git estimates, no questions).
 - Pass the arguments through exactly. Without `--background`, run in the foreground.
 - Return the command's stdout verbatim. Do not summarize or re-read files it mentions.
-- `--full` returns Mistral's complete review instead of the short default (top findings, one line each).
+- Reviews return Mistral's complete output. `--brief` asks for a short version (top 7 findings, one line each, printed output capped).
 
 Foreground:
 ```bash

@@ -1,6 +1,6 @@
 ---
 description: Run a Mistral Vibe review that challenges the chosen approach and design
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <alias>] [--full] [focus ...]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <alias>] [--brief] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

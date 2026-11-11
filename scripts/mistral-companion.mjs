@@ -217,7 +217,10 @@ function collectReviewContext(cwd, { scope, base }) {
     let t = text;
     if (t.length > budget) t = t.slice(0, budget) + "\n[... truncated ...]";
     budget -= t.length;
-    parts.push(`### ${label}\n\`\`\`\n${t}\n\`\`\``);
+    // Fence longer than any backtick run in the content so reviewed text cannot close it.
+    const longest = Math.max(0, ...(t.match(/`+/g) || []).map((m) => m.length));
+    const fence = "`".repeat(Math.max(3, longest + 1));
+    parts.push(`### ${label}\n${fence}\n${t}\n${fence}`);
   };
   let target;
   if (mode === "branch") {
@@ -240,14 +243,21 @@ function collectReviewContext(cwd, { scope, base }) {
         const full = path.join(cwd, f);
         const st = fs.lstatSync(full); // lstat: never follow symlinks out of the repo
         if (!st.isFile()) continue;
-        const fd = fs.openSync(full, "r");
-        let buf;
+        // Open without following symlinks, then re-check the opened handle (closes the lstat->open race).
+        const root = fs.realpathSync.native(cwd);
+        const real = fs.realpathSync.native(full);
+        if (real !== root && !real.startsWith(root + path.sep)) continue;
+        const fd = fs.openSync(full, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+        let buf, size;
         try {
-          buf = Buffer.alloc(Math.min(st.size, MAX_UNTRACKED_FILE_BYTES));
+          const fst = fs.fstatSync(fd);
+          if (!fst.isFile()) continue;
+          size = fst.size;
+          buf = Buffer.alloc(Math.min(size, MAX_UNTRACKED_FILE_BYTES));
           fs.readSync(fd, buf, 0, buf.length, 0);
         } finally { fs.closeSync(fd); }
         if (isBinary(buf)) { take(`untracked file ${f}`, "[binary file omitted]"); continue; }
-        take(`untracked file ${f}`, buf.toString("utf8") + (st.size > buf.length ? "\n[... truncated ...]" : ""));
+        take(`untracked file ${f}`, buf.toString("utf8") + (size > buf.length ? "\n[... truncated ...]" : ""));
       } catch {}
     }
   }
@@ -328,7 +338,9 @@ async function cmdStatus(argv) {
       const deadline = Date.now() + (Number(opts["timeout-ms"]) || 240000);
       while (j.status === "running" && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 2000));
-        j = findJob(dir, j.id);
+        const next = findJob(dir, j.id);
+        if (!next || next === "ambiguous") { console.error("Job record disappeared while waiting."); return 1; }
+        j = next;
       }
     }
     if (opts.json) console.log(JSON.stringify(j, null, 2));

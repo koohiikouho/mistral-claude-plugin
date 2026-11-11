@@ -103,4 +103,21 @@ test("running the script through a path with different casing still executes the
   assert.match(r.stdout, /No Mistral jobs|Job/);
 });
 
+test("classifyOutcome: only real early stops are partial", () => {
+  const c = m.classifyOutcome;
+  assert.equal(c({ code: 0, outcome: "finished", stopReason: null, hasOutput: true }), "completed");
+  assert.equal(c({ code: 0, outcome: "finished", stopReason: "end_turn", hasOutput: true }), "completed");
+  assert.equal(c({ code: 0, stopReason: "limit", hasOutput: true }), "partial");
+  assert.equal(c({ code: 0, stopReason: "max_turns", hasOutput: true }), "partial");
+  assert.equal(c({ code: 3, hasOutput: true }), "partial");
+  assert.equal(c({ code: 1, hasOutput: true }), "failed");
+  assert.equal(c({ code: 0, outcome: "error", hasOutput: true }), "failed");
+  assert.equal(c({ code: 0, hasOutput: false }), "failed");
+});
+
+test("review rejects an unknown --base instead of reporting nothing to review", () => {
+  const dir = repo("badbase");
+  assert.throws(() => m.collectReviewContext(dir, { scope: "branch", base: "no-such-ref" }), /Unknown base ref: no-such-ref/);
+});
+
 test("cleanup", () => { fs.rmSync(tmp, { recursive: true, force: true }); });

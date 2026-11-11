@@ -196,11 +196,7 @@ async function runJob({ kind, title, cwd, prompt, write = false, resumeId = null
   job.exitCode = r.code;
   job.output = r.stdout.trim();
   job.stderr = r.stderr.trim().split(/\r?\n/).filter((l) => !/^Reading API keys from the system keyring/.test(l)).join("\n");
-  const outcome = exp?.outcome;
-  if (outcome === "error" || (r.code !== 0 && r.code !== 3)) job.status = "failed";
-  else if (r.code === 3 || job.stopReason) job.status = "partial";
-  else job.status = "completed";
-  if (!job.output && job.status === "completed") job.status = "failed";
+  job.status = classifyOutcome({ code: r.code, outcome: exp?.outcome, stopReason: job.stopReason, hasOutput: !!job.output });
   if (job.status === "failed") job.error = exp?.error || job.stderr || `vibe exited with code ${r.code}`;
   job.finishedAt = new Date().toISOString();
   saveJob(dir, job);
@@ -208,6 +204,15 @@ async function runJob({ kind, title, cwd, prompt, write = false, resumeId = null
   if (json) console.log(JSON.stringify(job, null, 2));
   else console.log(renderResult(job));
   return job.status === "failed" ? 1 : 0;
+}
+
+// Stop reasons that mean the run was cut short (observed: "limit"). Anything else on a clean
+// exit-0 run (e.g. a normal end-of-turn reason) is still a completed run.
+const EARLY_STOP = /limit|max[_ -]?(turns?|tokens?|price|cost)|timeout|timed[_ -]?out|interrupt|budget/i;
+function classifyOutcome({ code, outcome, stopReason, hasOutput }) {
+  if (outcome === "error" || (code !== 0 && code !== 3)) return "failed";
+  if (code === 3 || (stopReason && EARLY_STOP.test(stopReason))) return "partial";
+  return hasOutput ? "completed" : "failed";
 }
 
 function renderResult(job) {
@@ -254,6 +259,7 @@ function collectReviewContext(cwd, { scope, base }) {
   if (mode === "branch") {
     const b = resolveBase(cwd, base);
     if (!b) throw new Error("Could not determine a base branch. Pass --base <ref>.");
+    if (!git(["rev-parse", "--verify", "-q", `${b}^{commit}`], cwd).ok) throw new Error(`Unknown base ref: ${b}`);
     target = `branch diff ${b}...HEAD`;
     take("git diff --stat", git(["diff", "--stat", `${b}...HEAD`], cwd).out);
     take("git diff", git(["diff", `${b}...HEAD`], cwd).out);
@@ -444,7 +450,7 @@ function cmdSetup(argv) {
   return 0;
 }
 
-export { splitRaw, parseArgs, collectReviewContext, listJobs, saveJob, pruneJobs, findJob, pidIsOurs, MAX_JOBS };
+export { classifyOutcome, splitRaw, parseArgs, collectReviewContext, listJobs, saveJob, pruneJobs, findJob, pidIsOurs, MAX_JOBS };
 
 // ---------- main ----------
 // Compare real paths: Node resolves the entry point's realpath, so symlinks or Windows case

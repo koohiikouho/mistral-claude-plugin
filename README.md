@@ -47,6 +47,7 @@ It is a port of the idea behind [openai/codex-plugin-cc](https://github.com/open
 ### Review options
 - `--scope auto|working-tree|branch`: `auto` reviews your uncommitted changes if there are any, otherwise the current branch against its base.
 - `--base <ref>`: the branch to diff against (defaults to `origin/HEAD`, then `main` or `master`).
+- `--model <alias>`: run the review with a specific Vibe model (see below).
 - `--wait` / `--background`: run in the foreground, or as a Claude Code background task. Without either, Claude asks based on the size of the change.
 
 ### Rescue options
@@ -56,9 +57,20 @@ It is a port of the idea behind [openai/codex-plugin-cc](https://github.com/open
 
 Rescue runs go through the `mistral:mistral-rescue` subagent. Claude can also call that subagent on its own when it is stuck.
 
+## Choosing a model
+
+The plugin passes `--model <alias>` straight to `vibe`, so any model alias Vibe knows works, including models from Mistral's hosted catalog such as `deepseek@mistral`:
+
+```
+/mistral:rescue --model deepseek@mistral investigate the flaky test
+/mistral:review --model deepseek@mistral
+```
+
+To change the default for every command, set `active_model` in `~/.vibe/config.toml`. `--model` only applies to new sessions; a resumed rescue session keeps its original model.
+
 ## How it works
 
-- **Reviews** run `vibe --agent ask`. Vibe can read files but its write and shell tools are denied. The diff, including untracked files (size-capped), is placed in the prompt.
+- **Reviews** run `vibe --agent ask`. Vibe can read files but its write and shell tools are denied. The diff is placed in the prompt (size-capped). Untracked files are included for working-tree reviews only, not for `--scope branch`.
 - **Rescue** runs use `vibe --auto-approve`, which lets Vibe edit files and run commands without asking. A headless run cannot answer approval prompts, so there is no in-between mode. Only use rescue in repositories where you are comfortable with that.
 - Prompts are passed with `--prompt-file`, so large diffs do not hit command-line limits.
 - Each run is recorded as a job under the plugin data directory (`~/.cache/mistral-companion` if run outside Claude Code). Stop reason, token usage and session id come from Vibe's `--output-dir` export.

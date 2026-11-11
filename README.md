@@ -30,7 +30,7 @@ It is a port of the idea behind [openai/codex-plugin-cc](https://github.com/open
 | `/mistral:status [job-id]` | List jobs for this repo, or show one |
 | `/mistral:result [job-id]` | Show the stored output of a finished job |
 | `/mistral:cancel [job-id]` | Stop a running job |
-| `/mistral:setup` | Check that Vibe is installed and can run headless |
+| `/mistral:setup [--fix-vibe]` | Check that Vibe is installed and can run headless; `--fix-vibe` patches a Vibe write stall on Windows |
 
 ### Examples
 
@@ -100,7 +100,7 @@ The defaults are tuned for using Vibe alongside Claude:
 
 While a job runs, the plugin watches Vibe's session journal and records the latest action. `/mistral:status <job-id>` shows it as `Last activity: <action> (<n>s ago)`, so you can tell a working run from a stuck one even though the output stays empty until the run ends. Vibe's `--time-limit` (default 1800 seconds) ends a stuck run. As a backstop, the plugin kills the Vibe process tree if it is still running 120 seconds after the limit, and reports the last journal activity and session id in the error.
 
-**Known Vibe issue (Windows):** a `write_file` that creates a *new* file stalls until the time limit when the folder is in a git repository with a `.gitattributes` file, or in a linked git worktree. The file is written only when the run ends. Vibe runs `git check-attr` to choose the new file's line ending, without closing stdin. In Vibe's app server that git process stalls before it starts, and the 5-second timeout cannot free it, because it kills only Git for Windows' `cmd\git.exe` launcher. Edits to existing files are not affected. Until Vibe fixes it, a run that creates new files there will sit until its time limit; `/mistral:status` shows `Running file_system.write_file` with a growing age.
+**Known Vibe issue (Windows):** a `write_file` that creates a *new* file stalls until the time limit when the folder is in a git repository with a `.gitattributes` file, or in a linked git worktree. The file is written only when the run ends. Vibe runs `git check-attr` to choose the new file's line ending, without closing stdin. In Vibe's app server that git process stalls before it starts, and the 5-second timeout cannot free it, because it kills only Git for Windows' `cmd\git.exe` launcher. Edits to existing files are not affected. `/mistral:setup` checks for this, and `/mistral:setup --fix-vibe` patches your installed Vibe: it adds `stdin=subprocess.DEVNULL` to that one git call and keeps the original as `_sandbox_helper.py.orig`. Updating Vibe undoes the patch, so run `/mistral:setup` again after an update. The check covers Vibe installed with `uv tool`; if setup cannot find the file, the stuck run ends at its time limit, and `/mistral:status` shows `Running file_system.write_file` with a growing age.
 
 ## How it works
 

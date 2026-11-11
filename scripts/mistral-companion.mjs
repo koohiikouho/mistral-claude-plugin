@@ -604,9 +604,59 @@ function cmdCancel(argv) {
   return 0;
 }
 
+// ---------- Vibe new-file write stall (Windows) ----------
+// Vibe's _git_eol runs `git check-attr` without closing stdin. Inside Vibe's app server that git
+// stalls at startup, and the 5 s timeout kills only Git for Windows' cmd\git.exe launcher, so a
+// write_file that creates a new file (in a repo with .gitattributes, or a linked worktree) waits
+// until the run's time limit. The fix is `stdin=subprocess.DEVNULL` on that call.
+const VIBE_HELPER_REL = path.join("mistralai_vibe_local_harness", "vibe", "_sandbox_helper.py");
+
+function vibeHelperPath() {
+  const toolDirs = [process.env.UV_TOOL_DIR, process.env.APPDATA && path.join(process.env.APPDATA, "uv", "tools"),
+    path.join(os.homedir(), ".local", "share", "uv", "tools")].filter(Boolean);
+  for (const d of toolDirs) {
+    const venv = path.join(d, "mistral-vibe");
+    const win = path.join(venv, "Lib", "site-packages", VIBE_HELPER_REL);
+    if (fs.existsSync(win)) return win;
+    let libs = [];
+    try { libs = fs.readdirSync(path.join(venv, "lib")).filter((n) => n.startsWith("python")); } catch {}
+    for (const l of libs) { const p = path.join(venv, "lib", l, "site-packages", VIBE_HELPER_REL); if (fs.existsSync(p)) return p; }
+  }
+  return null;
+}
+
+// Returns { state: "fixed" | "needs-fix" | "unknown", text } where text is the patched source for "needs-fix".
+function gitStallFix(src) {
+  const start = src.indexOf("def _git_eol(");
+  if (start < 0) return { state: "unknown" };
+  const next = src.indexOf("\ndef ", start + 1);
+  const body = src.slice(start, next < 0 ? src.length : next);
+  if (/\bstdin\s*=/.test(body)) return { state: "fixed" };
+  const m = /\n([ \t]+)capture_output=True,(\r?\n)/.exec(body);
+  if (!m) return { state: "unknown" };
+  const at = start + m.index + m[0].length;
+  return { state: "needs-fix", text: src.slice(0, at) + `${m[1]}stdin=subprocess.DEVNULL,${m[2]}` + src.slice(at) };
+}
+
+function checkVibeGitStall({ fix = false } = {}) {
+  const file = vibeHelperPath();
+  if (!file) return { state: "not-found" };
+  let src;
+  try { src = fs.readFileSync(file, "utf8"); } catch (e) { return { state: "unreadable", file, error: e.message }; }
+  const r = gitStallFix(src);
+  if (r.state !== "needs-fix" || !fix) return { state: r.state, file };
+  try {
+    const backup = `${file}.orig`;
+    if (!fs.existsSync(backup)) fs.writeFileSync(backup, src, "utf8");
+    fs.writeFileSync(file, r.text, "utf8");
+    return { state: "patched", file, backup };
+  } catch (e) { return { state: "patch-failed", file, error: e.message }; }
+}
+
 // ---------- setup ----------
 function cmdSetup(argv) {
-  const { opts } = parseArgs(splitRaw(argv), { boolFlags: ["json"] });
+  const { opts } = parseArgs(splitRaw(argv), { boolFlags: ["json", "fix-vibe"] });
+  const stall = IS_WIN ? checkVibeGitStall({ fix: !!opts["fix-vibe"] }) : null;
   const version = vibeVersion();
   const node = process.version;
   const keyring = process.env.MISTRAL_API_KEY ? "env MISTRAL_API_KEY" : null;
@@ -622,18 +672,23 @@ function cmdSetup(argv) {
     auth = { ready: smoke, detail: smoke ? (keyring || "configured") : ((r.stderr || r.stdout || "").trim().split(/\r?\n/).filter((l) => !/keyring/.test(l)).join(" ").slice(0, 300) || "headless run failed") };
     fs.rmSync(tmp, { recursive: true, force: true });
   }
-  const report = {
-    ready: !!version && auth.ready, node, vibe: { available: !!version, version }, auth,
-    nextSteps: !version ? ["Install Mistral Vibe (see https://docs.mistral.ai/), then rerun /mistral:setup."]
-      : !auth.ready ? ["Run `!vibe --setup` to configure your API key, then rerun /mistral:setup."] : [],
-  };
+  const nextSteps = !version ? ["Install Mistral Vibe (see https://docs.mistral.ai/), then rerun /mistral:setup."]
+    : !auth.ready ? ["Run `!vibe --setup` to configure your API key, then rerun /mistral:setup."] : [];
+  if (stall?.state === "needs-fix") nextSteps.push("Run `/mistral:setup --fix-vibe` to patch Vibe's new-file write stall (see README, Stuck runs).");
+  const report = { ready: !!version && auth.ready, node, vibe: { available: !!version, version }, auth, vibeGitStall: stall, nextSteps };
+  const stallText = !stall ? null : {
+    fixed: "fix applied", patched: `patched now (backup: ${stall.backup})`, "needs-fix": "NOT fixed",
+    "not-found": "Vibe's helper file not found (non-uv install?); not checked", unknown: "Vibe's code changed; patch not applicable (may be fixed upstream)",
+    unreadable: `could not read ${stall.file}: ${stall.error}`, "patch-failed": `patch failed: ${stall.error}`,
+  }[stall.state];
   if (opts.json) console.log(JSON.stringify(report, null, 2));
   else console.log([`Mistral setup: ${report.ready ? "ready" : "NOT ready"}`, `- Node: ${node}`, `- vibe: ${version || "not found on PATH"}`,
-    `- Headless run: ${auth.ready ? "ok" : `failed (${auth.detail})`}`, ...report.nextSteps.map((s) => `- Next: ${s}`)].join("\n"));
+    `- Headless run: ${auth.ready ? "ok" : `failed (${auth.detail})`}`,
+    ...(stallText ? [`- New-file write stall (Windows): ${stallText}`] : []), ...nextSteps.map((s) => `- Next: ${s}`)].join("\n"));
   return 0;
 }
 
-export { parseEffort, resolveEffort, parseCompactAt, vibeEnv, deepseekEntry, NOISE_RE, renderResult, classifyOutcome, splitRaw, parseArgs, collectReviewContext, listJobs, saveJob, pruneJobs, findJob, pidIsOurs, MAX_JOBS };
+export { gitStallFix, parseEffort,resolveEffort, parseCompactAt, vibeEnv, deepseekEntry, NOISE_RE, renderResult, classifyOutcome, splitRaw, parseArgs, collectReviewContext, listJobs, saveJob, pruneJobs, findJob, pidIsOurs, MAX_JOBS };
 
 // ---------- main ----------
 // Compare real paths: Node resolves the entry point's realpath, so symlinks or Windows case

@@ -189,4 +189,26 @@ test("--effort is validated and resolved against the model's levels", () => {
   assert.equal(m.vibeEnv("deepseek@mistral").VIBE_MODELS.includes('"thinking":"max"'), true);
 });
 
+test("gitStallFix adds stdin=DEVNULL to _git_eol only, keeping CRLF", () => {
+  const src = [
+    "def _git_eol(path, repository):",
+    "    try:",
+    "        completed = subprocess.run(",
+    "            [git, \"check-attr\"],",
+    "            capture_output=True,",
+    "            text=True,",
+    "        )",
+    "",
+    "def other():",
+    "    subprocess.run([\"ps\"], capture_output=True)",
+    "",
+  ].join("\r\n");
+  const r = m.gitStallFix(src);
+  assert.equal(r.state, "needs-fix");
+  assert.ok(r.text.includes("            capture_output=True,\r\n            stdin=subprocess.DEVNULL,\r\n            text=True,"));
+  assert.equal(r.text.match(/stdin=/g).length, 1);
+  assert.equal(m.gitStallFix(r.text).state, "fixed");
+  assert.equal(m.gitStallFix("def other():\n    pass\n").state, "unknown");
+});
+
 test("cleanup", () => { fs.rmSync(tmp, { recursive: true, force: true }); });

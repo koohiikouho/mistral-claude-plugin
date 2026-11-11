@@ -1,6 +1,6 @@
 {
   "name": "mistral",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Use Mistral Vibe from Claude Code to review code or delegate tasks.",
   "author": { "name": "__kohiko" },
   "license": "Apache-2.0"

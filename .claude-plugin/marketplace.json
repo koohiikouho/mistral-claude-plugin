@@ -3,13 +3,13 @@
   "owner": { "name": "__kohiko" },
   "metadata": {
     "description": "Mistral Vibe plugin for Claude Code: delegation and code review.",
-    "version": "0.1.2"
+    "version": "0.1.3"
   },
   "plugins": [
     {
       "name": "mistral",
       "description": "Use Mistral Vibe from Claude Code to review code or delegate tasks.",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "author": { "name": "__kohiko" },
       "source": "./"
     }

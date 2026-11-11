@@ -90,24 +90,31 @@ function pruneJobs(dir) {
     for (const f of fs.readdirSync(dir)) if (f.startsWith(j.id)) fs.rmSync(path.join(dir, f), { recursive: true, force: true });
   }
 }
-// Start time (ms since epoch) of a live process, or null if it is gone or unreadable.
+function pidExists(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
+}
+// Start time (ms since epoch) of a process, or null if it could not be read (the caller checks existence separately).
 function procStartMs(pid) {
   if (!pid) return null;
   const r = IS_WIN
     ? spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command",
         `(Get-Process -Id ${Number(pid)} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')`], { encoding: "utf8", windowsHide: true })
-    : spawnSync("ps", ["-o", "lstart=", "-p", String(Number(pid))], { encoding: "utf8" });
+    : spawnSync("ps", ["-o", "lstart=", "-p", String(Number(pid))], { encoding: "utf8", env: { ...process.env, LC_ALL: "C", LANG: "C" } });
   if (r.error || r.status !== 0) return null;
   const t = Date.parse((r.stdout || "").trim());
   return Number.isNaN(t) ? null : t;
 }
 // PID reuse guard: a process that took over a dead job's PID started after the job did.
 const PID_START_SLACK_MS = 5000;
-function pidIsOurs(pid, notAfterIso) {
-  const start = procStartMs(pid);
-  if (start === null) return false;
+// Three outcomes: gone -> false; exists but start time unreadable -> true (never skip killing a live
+// job or fail a running one because a probe broke); exists and readable -> started no later than the job.
+function pidIsOurs(pid, notAfterIso, probe = procStartMs) {
+  if (!pidExists(pid)) return false;
+  const start = probe(pid);
+  if (start === null) return true;
   const limit = Date.parse(notAfterIso);
-  return Number.isNaN(limit) ? false : start <= limit + PID_START_SLACK_MS;
+  return Number.isNaN(limit) ? true : start <= limit + PID_START_SLACK_MS;
 }
 // A "running" job whose companion process died is reported as failed.
 function reconcile(dir, job) {
@@ -440,7 +447,13 @@ function cmdSetup(argv) {
 export { splitRaw, parseArgs, collectReviewContext, listJobs, saveJob, pruneJobs, findJob, pidIsOurs, MAX_JOBS };
 
 // ---------- main ----------
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+// Compare real paths: Node resolves the entry point's realpath, so symlinks or Windows case
+// differences would otherwise make every command silently do nothing.
+const isMain = (() => {
+  if (!process.argv[1]) return false;
+  try { return fs.realpathSync.native(path.resolve(process.argv[1])) === fs.realpathSync.native(fileURLToPath(import.meta.url)); }
+  catch { return true; }
+})();
 const [cmd, ...args] = isMain ? process.argv.slice(2) : [];
 const table = {
   setup: () => cmdSetup(args),

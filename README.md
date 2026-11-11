@@ -80,7 +80,7 @@ node scripts/mistral-companion.mjs task --write "do the thing"
 node scripts/mistral-companion.mjs status
 ```
 
-Run the unit tests with `npm test` (Node built-in test runner, no dependencies) and validate the manifests with `claude plugin validate .`.
+Run the unit tests with `npm test` (Node built-in test runner, no dependencies; needs Node 21+ for the glob in the test script) and validate the manifests with `claude plugin validate .`.
 
 ## License
 

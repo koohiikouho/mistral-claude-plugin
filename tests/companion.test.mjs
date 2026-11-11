@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
+// A PID that is guaranteed dead: spawn a short-lived child and let it exit.
+const deadPid = (() => { const r = spawnSync(process.execPath, ["-e", ""]); return r.pid; })();
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mistral-test-"));
 process.env.CLAUDE_PLUGIN_DATA = path.join(tmp, "data");
 const m = await import("../scripts/mistral-companion.mjs");
@@ -80,14 +82,25 @@ test("findJob matches by prefix, reports ambiguity, and fails dead running jobs"
   assert.equal(m.findJob(dir, "review").id, "review-zzz");
   assert.equal(m.findJob(dir, "task-aaa"), "ambiguous");
   assert.equal(m.findJob(dir, "nope"), undefined);
-  m.saveJob(dir, job("task-dead", { status: "running", companionPid: 999999 }));
+  m.saveJob(dir, job("task-dead", { status: "running", companionPid: deadPid }));
   assert.equal(m.findJob(dir, "task-dead").status, "failed");
 });
 
 test("pidIsOurs rejects dead PIDs and PIDs that started after the job", () => {
-  assert.equal(m.pidIsOurs(999999, new Date().toISOString()), false);
+  assert.equal(m.pidIsOurs(deadPid, new Date().toISOString()), false);
   assert.equal(m.pidIsOurs(process.pid, new Date().toISOString()), true);
   assert.equal(m.pidIsOurs(process.pid, new Date(Date.now() - 24 * 3600 * 1000).toISOString()), false);
+});
+
+test("pidIsOurs trusts a live PID whose start time cannot be read", () => {
+  assert.equal(m.pidIsOurs(process.pid, new Date(0).toISOString(), () => null), true);
+});
+
+test("running the script through a path with different casing still executes the command", () => {
+  const script = path.resolve("scripts/mistral-companion.mjs");
+  const alt = process.platform === "win32" ? script.replace(/scripts/i, "SCRIPTS") : script;
+  const r = spawnSync(process.execPath, [alt, "status"], { encoding: "utf8", env: { ...process.env, CLAUDE_PLUGIN_DATA: path.join(tmp, "data2") } });
+  assert.match(r.stdout, /No Mistral jobs|Job/);
 });
 
 test("cleanup", () => { fs.rmSync(tmp, { recursive: true, force: true }); });

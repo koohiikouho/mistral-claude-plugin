@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const MAX_JOBS = 50;
 const MAX_REVIEW_BYTES = 100_000;
+const MAX_CONTEXT_KB = 2000;
 const BRIEF_PRINT_CHARS = 4000; // cap on what is printed (and so enters Claude's context) in brief mode
 const NOISE_PATHSPECS = ["*package-lock.json", "*npm-shrinkwrap.json", "*yarn.lock", "*pnpm-lock.yaml", "*.lock", "*go.sum", "*.min.js", "*.min.css", "*.map", "*.snap"]
   .map((p) => `:(exclude)${p}`);
@@ -269,12 +270,12 @@ function resolveBase(cwd, explicit) {
 }
 function isBinary(buf) { return buf.subarray(0, 8000).includes(0); }
 
-function collectReviewContext(cwd, { scope, base }) {
+function collectReviewContext(cwd, { scope, base, maxBytes = MAX_REVIEW_BYTES }) {
   const status = git(["status", "--short", "--untracked-files=all"], cwd).out.trim();
   let mode = scope || "auto";
   if (!["auto", "working-tree", "branch"].includes(mode)) throw new Error(`Invalid --scope "${mode}". Use auto, working-tree or branch.`);
   if (mode === "auto") mode = status ? "working-tree" : "branch";
-  let budget = MAX_REVIEW_BYTES;
+  let budget = maxBytes;
   const parts = [];
   const take = (label, text) => {
     if (!text.trim() || budget <= 0) return;
@@ -333,11 +334,17 @@ function collectReviewContext(cwd, { scope, base }) {
 function loadPrompt(name) { return fs.readFileSync(path.join(ROOT, "prompts", `${name}.md`), "utf8"); }
 
 async function cmdReview(argv, adversarial) {
-  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["base", "scope", "model", "max-turns", "time-limit"], boolFlags: ["wait", "background", "json", "brief"] });
+  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["base", "scope", "model", "max-turns", "time-limit", "context-size"], boolFlags: ["wait", "background", "json", "brief"] });
   const cwd = process.cwd();
   if (!git(["rev-parse", "--is-inside-work-tree"], cwd).ok) { console.error("Not inside a git repository."); return 1; }
+  let maxBytes;
+  if (opts["context-size"] !== undefined) {
+    const kb = Number(opts["context-size"]);
+    if (!Number.isFinite(kb) || kb < 1 || kb > MAX_CONTEXT_KB) { console.error(`Invalid --context-size "${opts["context-size"]}". Use a number of KB from 1 to ${MAX_CONTEXT_KB}.`); return 1; }
+    maxBytes = Math.floor(kb * 1000);
+  }
   let ctx;
-  try { ctx = collectReviewContext(cwd, { scope: opts.scope, base: opts.base }); }
+  try { ctx = collectReviewContext(cwd, { scope: opts.scope, base: opts.base, maxBytes }); }
   catch (e) { console.error(e.message); return 1; }
   if (!ctx) { console.log("Nothing to review: no changes found for the selected scope."); return 0; }
   const focus = rest.join(" ").trim();

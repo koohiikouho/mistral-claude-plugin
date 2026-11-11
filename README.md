@@ -48,6 +48,7 @@ It is a port of the idea behind [openai/codex-plugin-cc](https://github.com/open
 - `--scope auto|working-tree|branch`: `auto` reviews your uncommitted changes if there are any, otherwise the current branch against its base.
 - `--base <ref>`: the branch to diff against (defaults to `origin/HEAD`, then `main` or `master`).
 - `--model <alias>`: run the review with a specific Vibe model (see below).
+- `--context-size <KB>`: how much diff and file content goes into the review prompt (default 100, max 2000). Raise it for big changes, lower it to save tokens. Past the limit the diff is truncated; the `--stat` summary is always included first.
 - `--wait` / `--background`: run in the foreground (the default), or as a Claude Code background task.
 - `--brief`: ask for a short review (top 7 findings, one line each; printed output capped). Reviews are full-length by default.
 
@@ -77,7 +78,7 @@ The defaults are tuned for using Vibe alongside Claude:
 
 - **No preliminary turns.** `/mistral:review` runs immediately; Claude does not run size estimates or ask a question first.
 - **Full reviews, short rescue replies.** Reviews return everything Mistral says; add `--brief` when you want only the top findings. Rescue runs reply with a short summary and a `git diff --stat` of what changed (printed output capped at about 4000 characters; `--full` on the command, or `/mistral:result <id> --full`, returns everything).
-- **Smaller review input.** Lockfiles, minified files, source maps and snapshots are left out of the diff, and the review input is capped at 100 KB.
+- **Smaller review input.** Lockfiles, minified files, source maps and snapshots are left out of the diff, and the review input is capped at 100 KB (`--context-size` to change).
 - **Fewer turns.** Reviews stop after 15 turns by default (`--max-turns` to change).
 - **Pick a cheaper model** for routine work with `--model`.
 

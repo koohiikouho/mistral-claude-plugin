@@ -237,6 +237,52 @@ function parseCompactAt(raw) {
   return { value: n };
 }
 
+// ---------- activity tracking (Vibe's session journal) ----------
+// A hung tool call leaves no output until the run ends, so poll the session journal and record the last
+// action and when it happened. Vibe also ignores --time-limit while a tool call hangs, so a hard watchdog
+// kills the process tree a grace period after the limit.
+const HANG_GRACE_S = Number(process.env.MISTRAL_HANG_GRACE_S) || 120; // env override is for testing the watchdog
+const ACTIVITY_POLL_MS = Number(process.env.MISTRAL_ACTIVITY_POLL_MS) || 10_000;
+function sessionRoot() { return path.join(process.env.VIBE_HOME || path.join(os.homedir(), ".vibe"), "logs", "session", "unified"); }
+function listSessionIds() { try { return fs.readdirSync(sessionRoot()); } catch { return []; } }
+const normPath = (p) => String(p || "").replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
+const samePath = (a, b) => normPath(a) === normPath(b);
+function findSessionId(before, cwd) {
+  for (const id of listSessionIds()) {
+    if (before.has(id)) continue;
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(sessionRoot(), id, "meta.json"), "utf8"));
+      if (samePath(meta.origin_directory || meta.environment?.working_directory, cwd)) return id;
+    } catch {}
+  }
+  return null;
+}
+// Returns { label, at } for the newest journal record of a session, or null.
+function journalActivity(sessionId) {
+  try {
+    const jd = path.join(sessionRoot(), sessionId, "journal");
+    const files = fs.readdirSync(jd).filter((f) => f.endsWith(".jsonl")).sort();
+    if (!files.length) return null;
+    const f = path.join(jd, files[files.length - 1]);
+    const st = fs.statSync(f);
+    const len = Math.min(st.size, 1 << 20);
+    const buf = Buffer.alloc(len);
+    const fd = fs.openSync(f, "r");
+    try { fs.readSync(fd, buf, 0, len, st.size - len); } finally { fs.closeSync(fd); }
+    const lines = buf.toString("utf8").split("\n").filter(Boolean);
+    let label = "activity";
+    for (let i = lines.length - 1; i >= 0 && i >= lines.length - 5; i--) {
+      try {
+        const p = JSON.parse(lines[i]);
+        const e = p.payload?.delta?.[0]?.entry;
+        const t = e?.detail?.display?.statusText || (p.payload?.kind ? p.payload.kind + (p.payload.request?.call?.name ? " " + p.payload.request.call.name : "") : null);
+        if (t) { label = String(t).slice(0, 120); break; }
+      } catch {}
+    }
+    return { label, at: st.mtime.toISOString() };
+  } catch { return null; }
+}
+
 function runVibe({ cwd, dir, job, prompt, write, resumeId, model, maxTurns, timeLimit, compactAt, effortEntry }) {
   const promptFile = path.join(dir, `${job.id}.prompt.txt`);
   const outDir = path.join(dir, `${job.id}.out`);
@@ -252,14 +298,32 @@ function runVibe({ cwd, dir, job, prompt, write, resumeId, model, maxTurns, time
     job.vibePid = child.pid;
     job.vibeSpawnedAt = new Date().toISOString();
     saveJob(dir, job);
-    let stdout = "", stderr = "";
+    let stdout = "", stderr = "", hung = false, sid = resumeId || null;
+    const before = new Set(listSessionIds());
+    const poll = setInterval(() => {
+      if (!sid) sid = findSessionId(before, cwd);
+      const act = sid && journalActivity(sid);
+      if (!act) return;
+      try { // update only this field on the fresh record so a concurrent cancel is not overwritten
+        const cur = JSON.parse(fs.readFileSync(jobFile(dir, job.id), "utf8"));
+        if (cur.status === "running" && JSON.stringify(cur.lastActivity) !== JSON.stringify(act)) { cur.lastActivity = act; saveJob(dir, cur); }
+      } catch {}
+    }, ACTIVITY_POLL_MS);
+    const guard = setTimeout(() => {
+      hung = true;
+      const act = sid && journalActivity(sid);
+      stderr += `Vibe did not exit within ${HANG_GRACE_S}s of its ${timeLimit}s time limit and was killed (likely a hung tool call).` +
+        (act ? ` Last journal activity: ${act.label} at ${act.at}.` : "") + (sid ? ` Session: ${sid}.` : "") + "\n"
+      killTree(child.pid, { group: !IS_WIN });
+    }, (timeLimit + HANG_GRACE_S) * 1000);
     child.stdout.setEncoding("utf8").on("data", (d) => (stdout += d));
     child.stderr.setEncoding("utf8").on("data", (d) => (stderr += d));
-    child.on("error", (e) => resolve({ code: -1, stdout, stderr: String(e.message), exp: null }));
+    child.on("error", (e) => { clearInterval(poll); clearTimeout(guard); resolve({ code: -1, stdout, stderr: String(e.message), exp: null }); });
     child.on("close", (code) => {
+      clearInterval(poll); clearTimeout(guard);
       let exp = null;
       try { exp = JSON.parse(fs.readFileSync(path.join(outDir, "export.json"), "utf8")); } catch {}
-      resolve({ code, stdout, stderr, exp });
+      resolve({ code: hung ? -1 : code, stdout, stderr, exp });
     });
   });
 }
@@ -497,6 +561,7 @@ async function cmdStatus(argv) {
     }
     if (opts.json) console.log(JSON.stringify(j, null, 2));
     else console.log([`Job ${j.id}`, `Kind: ${j.kind}`, `Status: ${j.status}`, `Elapsed: ${elapsed(j)}`, `Title: ${j.title}`,
+      j.status === "running" && j.lastActivity ? `Last activity: ${j.lastActivity.label} (${Math.max(0, Math.round((Date.now() - Date.parse(j.lastActivity.at)) / 1000))}s ago)` : null,
       j.sessionId ? `Session: ${j.sessionId}` : null, j.stopReason ? `Stop reason: ${j.stopReason}` : null, j.error ? `Error: ${j.error}` : null,
       j.status === "running" ? `Cancel: /mistral:cancel ${j.id}` : `Result: /mistral:result ${j.id}`].filter(Boolean).join("\n"));
     return 0;

@@ -96,6 +96,10 @@ The defaults are tuned for using Vibe alongside Claude:
 - **Fewer turns.** Reviews stop after 15 turns by default (`--max-turns` to change).
 - **Pick a cheaper model** for routine work with `--model`.
 
+## Stuck runs
+
+While a job runs, the plugin watches Vibe's session journal and records the latest action. `/mistral:status <job-id>` shows it as `Last activity: <action> (<n>s ago)`, so you can tell a working run from a stuck one even though the output stays empty until the run ends. Vibe's own `--time-limit` does not fire while a tool call hangs, so the plugin also kills the Vibe process tree 120 seconds after the time limit and reports the last journal activity and session id in the error.
+
 ## How it works
 
 - **Reviews** run `vibe --agent ask`. Vibe can read files but its write and shell tools are denied. The diff is placed in the prompt (size-capped). Untracked files are included for working-tree reviews only, not for `--scope branch`.

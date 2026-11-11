@@ -63,7 +63,7 @@ function stateDir(cwd) {
   try { canon = fs.realpathSync.native(ws); } catch {}
   const slug = (path.basename(ws) || "workspace").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canon).digest("hex").slice(0, 16);
-  const base = process.env.CLAUDE_PLUGIN_DATA ? path.join(process.env.CLAUDE_PLUGIN_DATA, "state") : path.join(os.tmpdir(), "mistral-companion");
+  const base = process.env.CLAUDE_PLUGIN_DATA ? path.join(process.env.CLAUDE_PLUGIN_DATA, "state") : path.join(os.homedir(), ".cache", "mistral-companion");
   const dir = path.join(base, `${slug}-${hash}`, "jobs");
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return dir;

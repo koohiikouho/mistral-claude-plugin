@@ -48,7 +48,8 @@ It is a port of the idea behind [openai/codex-plugin-cc](https://github.com/open
 - `--scope auto|working-tree|branch`: `auto` reviews your uncommitted changes if there are any, otherwise the current branch against its base.
 - `--base <ref>`: the branch to diff against (defaults to `origin/HEAD`, then `main` or `master`).
 - `--model <alias>`: run the review with a specific Vibe model (see below).
-- `--wait` / `--background`: run in the foreground, or as a Claude Code background task. Without either, Claude asks based on the size of the change.
+- `--wait` / `--background`: run in the foreground (the default), or as a Claude Code background task.
+- `--full`: return Mistral's complete output instead of the short default (see Saving tokens).
 
 ### Rescue options
 - `--resume` / `--fresh`: continue the last Vibe session for this repo, or start a new one.
@@ -66,7 +67,19 @@ The plugin passes `--model <alias>` straight to `vibe`, so any model alias Vibe 
 /mistral:review --model deepseek@mistral
 ```
 
+DeepSeek models (any alias containing `deepseek`) always run at **max reasoning**. Vibe has no flag for this, so the plugin sets it for that run only through the `VIBE_MODELS` environment variable; your config files are not touched. If you set `active_model` to a DeepSeek alias in `config.toml` and omit `--model`, pass `--model` anyway to get max reasoning.
+
 To change the default for every command, set `active_model` in `~/.vibe/config.toml`. `--model` only applies to new sessions; a resumed rescue session keeps its original model.
+
+## Saving tokens
+
+The defaults are tuned for using Vibe alongside Claude:
+
+- **No preliminary turns.** `/mistral:review` runs immediately; Claude does not run size estimates or ask a question first.
+- **Short results by default.** Reviews report at most 7 findings, one line each. Rescue runs reply with a short summary and a `git diff --stat` of what changed. Printed output is capped at about 4000 characters; `/mistral:result <id> --full` (or `--full` on the command) returns everything.
+- **Smaller review input.** Lockfiles, minified files, source maps and snapshots are left out of the diff, and the review input is capped at 100 KB.
+- **Fewer turns.** Reviews stop after 15 turns by default (`--max-turns` to change).
+- **Pick a cheaper model** for routine work with `--model`.
 
 ## How it works
 
@@ -74,7 +87,7 @@ To change the default for every command, set `active_model` in `~/.vibe/config.t
 - **Rescue** runs use `vibe --auto-approve`, which lets Vibe edit files and run commands without asking. A headless run cannot answer approval prompts, so there is no in-between mode. Only use rescue in repositories where you are comfortable with that.
 - Prompts are passed with `--prompt-file`, so large diffs do not hit command-line limits.
 - Each run is recorded as a job under the plugin data directory (`~/.cache/mistral-companion` if run outside Claude Code). Stop reason, token usage and session id come from Vibe's `--output-dir` export.
-- Runs stopped by a turn or time limit are shown as **partial** instead of success. Jobs default to a 30 minute and 60 turn cap.
+- Runs stopped by a turn or time limit are shown as **partial** instead of success. Tasks default to a 30 minute and 60 turn cap; reviews to 15 turns.
 - `/mistral:cancel` kills the whole Vibe process tree.
 
 ## Differences from the Codex plugin

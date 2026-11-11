@@ -15,10 +15,15 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const MAX_JOBS = 50;
-const MAX_REVIEW_BYTES = 300_000;
+const MAX_REVIEW_BYTES = 100_000;
+const BRIEF_PRINT_CHARS = 4000; // cap on what is printed (and so enters Claude's context) in brief mode
+const NOISE_PATHSPECS = ["*package-lock.json", "*npm-shrinkwrap.json", "*yarn.lock", "*pnpm-lock.yaml", "*.lock", "*go.sum", "*.min.js", "*.min.css", "*.map", "*.snap"]
+  .map((p) => `:(exclude)${p}`);
+const NOISE_RE = /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|go\.sum)$|\.(lock|min\.js|min\.css|map|snap)$/;
 const MAX_UNTRACKED_FILE_BYTES = 40_000;
 const DEFAULT_TIME_LIMIT = 1800; // seconds
 const DEFAULT_MAX_TURNS = 60;
+const DEFAULT_REVIEW_TURNS = 15;
 const IS_WIN = process.platform === "win32";
 
 // ---------- args ----------
@@ -142,6 +147,27 @@ function killTree(pid, { group = false } = {}) {
   } catch { try { process.kill(pid, "SIGKILL"); } catch {} }
 }
 
+// DeepSeek models always run at maximum reasoning. Vibe has no CLI flag for it, so override the model
+// entry through the VIBE_MODELS environment variable for this run only (no config files are touched).
+const DEEPSEEK_FALLBACK = { name: "deepseek-v4-1-flash-1017", provider: "mistral", alias: "deepseek@mistral" };
+function deepseekEntry(model) {
+  if (!model || !/deepseek/i.test(model)) return null;
+  try {
+    const cache = JSON.parse(fs.readFileSync(path.join(process.env.VIBE_HOME || path.join(os.homedir(), ".vibe"), "managed_config_cache.json"), "utf8"));
+    for (const v of Object.values(cache)) {
+      for (const blk of String(v.payload || "").split(/\[\[models\]\]/).slice(1)) {
+        const get = (k) => (blk.match(new RegExp(`^\\s*${k}\\s*=\\s*"([^"]*)"`, "m")) || [])[1];
+        if (get("alias") === model && get("name") && get("provider")) return { name: get("name"), provider: get("provider"), alias: model };
+      }
+    }
+  } catch {}
+  return model === DEEPSEEK_FALLBACK.alias ? { ...DEEPSEEK_FALLBACK } : null;
+}
+function vibeEnv(model) {
+  const e = deepseekEntry(model);
+  return e ? { ...process.env, VIBE_MODELS: JSON.stringify([{ ...e, thinking: "max" }]) } : process.env;
+}
+
 function runVibe({ cwd, dir, job, prompt, write, resumeId, model, maxTurns, timeLimit }) {
   const promptFile = path.join(dir, `${job.id}.prompt.txt`);
   const outDir = path.join(dir, `${job.id}.out`);
@@ -153,7 +179,7 @@ function runVibe({ cwd, dir, job, prompt, write, resumeId, model, maxTurns, time
   if (model) args.push("--model", model);
 
   return new Promise((resolve) => {
-    const child = spawn("vibe", args, { cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: !IS_WIN });
+    const child = spawn("vibe", args, { cwd, env: vibeEnv(model), stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: !IS_WIN });
     job.vibePid = child.pid;
     job.vibeSpawnedAt = new Date().toISOString();
     saveJob(dir, job);
@@ -169,11 +195,11 @@ function runVibe({ cwd, dir, job, prompt, write, resumeId, model, maxTurns, time
   });
 }
 
-async function runJob({ kind, title, cwd, prompt, write = false, resumeId = null, model = null, maxTurns, timeLimit, json }) {
+async function runJob({ kind, title, cwd, prompt, write = false, resumeId = null, model = null, maxTurns, timeLimit, json, brief = false }) {
   const dir = stateDir(cwd);
   const job = {
     id: `${kind}-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`,
-    kind, title, write, status: "running", cwd,
+    kind, title, write, brief, status: "running", cwd,
     claudeSession: sessionKey(), companionPid: process.pid,
     createdAt: new Date().toISOString(),
   };
@@ -199,6 +225,7 @@ async function runJob({ kind, title, cwd, prompt, write = false, resumeId = null
   job.status = classifyOutcome({ code: r.code, outcome: exp?.outcome, stopReason: job.stopReason, hasOutput: !!job.output });
   if (job.status === "failed") job.error = exp?.error || job.stderr || `vibe exited with code ${r.code}`;
   job.finishedAt = new Date().toISOString();
+  if (write && brief) job.diffStat = git(["diff", "--stat", "HEAD"], cwd).out.trim() || null;
   saveJob(dir, job);
 
   if (json) console.log(JSON.stringify(job, null, 2));
@@ -222,7 +249,11 @@ function renderResult(job) {
   } else {
     if (job.status === "partial")
       lines.push(`> **Partial result:** the run stopped early (${job.stopReason || `exit ${job.exitCode}`}). Output below may be incomplete.`, "");
-    lines.push(job.output || "(no output)");
+    const out = job.output || "(no output)";
+    if (job.brief && out.length > BRIEF_PRINT_CHARS) {
+      lines.push(out.slice(0, BRIEF_PRINT_CHARS), "", `[... output shortened (${out.length} chars); full text: /mistral:result ${job.id} --full]`);
+    } else lines.push(out);
+    if (job.diffStat) lines.push("", "Changed files (git diff --stat HEAD):", "```", job.diffStat, "```");
   }
   lines.push("", `_Job ${job.id}${job.sessionId ? ` · session ${job.sessionId}` : ""}${job.usage ? ` · ${job.usage.total_tokens} tokens` : ""}_`);
   return lines.join("\n");
@@ -261,18 +292,19 @@ function collectReviewContext(cwd, { scope, base }) {
     if (!b) throw new Error("Could not determine a base branch. Pass --base <ref>.");
     if (!git(["rev-parse", "--verify", "-q", `${b}^{commit}`], cwd).ok) throw new Error(`Unknown base ref: ${b}`);
     target = `branch diff ${b}...HEAD`;
-    take("git diff --stat", git(["diff", "--stat", `${b}...HEAD`], cwd).out);
-    take("git diff", git(["diff", `${b}...HEAD`], cwd).out);
+    take("git diff --stat", git(["diff", "--stat", `${b}...HEAD`, "--", ".", ...NOISE_PATHSPECS], cwd).out);
+    take("git diff", git(["diff", `${b}...HEAD`, "--", ".", ...NOISE_PATHSPECS], cwd).out);
     if (!parts.length) return null;
   } else {
     target = "working tree (staged, unstaged and untracked changes)";
     if (!status) return null;
     take("git status --short", status);
-    take("git diff --cached", git(["diff", "--cached"], cwd).out);
-    take("git diff (unstaged)", git(["diff"], cwd).out);
+    take("git diff --cached", git(["diff", "--cached", "--", ".", ...NOISE_PATHSPECS], cwd).out);
+    take("git diff (unstaged)", git(["diff", "--", ".", ...NOISE_PATHSPECS], cwd).out);
     const untracked = git(["ls-files", "--others", "--exclude-standard"], cwd).out.split(/\r?\n/).filter(Boolean);
     for (const f of untracked) {
       if (budget <= 0) break;
+      if (NOISE_RE.test(f)) continue;
       try {
         const full = path.join(cwd, f);
         const st = fs.lstatSync(full); // lstat: never follow symlinks out of the repo
@@ -301,7 +333,7 @@ function collectReviewContext(cwd, { scope, base }) {
 function loadPrompt(name) { return fs.readFileSync(path.join(ROOT, "prompts", `${name}.md`), "utf8"); }
 
 async function cmdReview(argv, adversarial) {
-  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["base", "scope", "model", "max-turns", "time-limit"], boolFlags: ["wait", "background", "json"] });
+  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["base", "scope", "model", "max-turns", "time-limit"], boolFlags: ["wait", "background", "json", "full"] });
   const cwd = process.cwd();
   if (!git(["rev-parse", "--is-inside-work-tree"], cwd).ok) { console.error("Not inside a git repository."); return 1; }
   let ctx;
@@ -313,16 +345,20 @@ async function cmdReview(argv, adversarial) {
   const prompt = loadPrompt(adversarial ? "adversarial-review" : "review")
     .replace("{{TARGET}}", () => ctx.target)
     .replace("{{FOCUS}}", () => focus || "(none)")
-    .replace("{{CONTEXT}}", () => ctx.body);
+    .replace("{{CONTEXT}}", () => ctx.body) + (opts.full ? "" : BRIEF_REVIEW_NOTE);
   return runJob({ kind: adversarial ? "adversarial-review" : "review", title: `${adversarial ? "Adversarial review" : "Review"}: ${ctx.target}`,
-    cwd, prompt, write: false, model: opts.model, maxTurns: num(opts["max-turns"]), timeLimit: num(opts["time-limit"]), json: opts.json });
+    cwd, prompt, write: false, model: opts.model, maxTurns: num(opts["max-turns"]) || DEFAULT_REVIEW_TURNS, timeLimit: num(opts["time-limit"]), json: opts.json, brief: !opts.full });
 }
+const BRIEF_REVIEW_NOTE = [
+  "", "", "## Brevity (token budget)",
+  "Report at most 7 findings, most severe first. One line each: `file:line — problem — fix`. No preamble, no praise, no restating the diff. If nothing material, reply `No material findings.`", "",
+].join("\n");
 const num = (v) => (v === undefined ? undefined : Number(v));
 
 // ---------- task ----------
 async function cmdTask(argv) {
   const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["model", "max-turns", "time-limit"],
-    boolFlags: ["write", "resume-last", "fresh", "background", "wait", "json"] });
+    boolFlags: ["write", "resume-last", "fresh", "background", "wait", "json", "full"] });
   const cwd = process.cwd();
   const task = rest.join(" ").trim();
   if (!task) { console.error("Provide a task description."); return 1; }
@@ -332,9 +368,11 @@ async function cmdTask(argv) {
     if (!cand) { console.error("No previous Mistral task session to resume. Run without --resume-last."); return 1; }
     resumeId = cand.sessionId;
   }
-  return runJob({ kind: "task", title: task.slice(0, 80), cwd, prompt: task, write: !!opts.write, resumeId,
-    model: opts.model, maxTurns: num(opts["max-turns"]), timeLimit: num(opts["time-limit"]), json: opts.json });
+  const prompt = opts.full ? task : task + BRIEF_TASK_NOTE;
+  return runJob({ kind: "task", title: task.slice(0, 80), cwd, prompt, write: !!opts.write, resumeId,
+    model: opts.model, maxTurns: num(opts["max-turns"]), timeLimit: num(opts["time-limit"]), json: opts.json, brief: !opts.full });
 }
+const BRIEF_TASK_NOTE = "\n\n(Token budget: when finished, reply with a short summary only — what you changed and why, under 150 words. Do not paste code or diffs.)";
 function resumeCandidate(cwd) {
   const dir = stateDir(cwd);
   const key = sessionKey();
@@ -394,14 +432,14 @@ async function cmdStatus(argv) {
 }
 
 function cmdResult(argv) {
-  const { opts, rest } = parseArgs(splitRaw(argv), { boolFlags: ["json"] });
+  const { opts, rest } = parseArgs(splitRaw(argv), { boolFlags: ["json", "full"] });
   const dir = stateDir(process.cwd());
   const ref = rest[0];
   const j = ref ? findJob(dir, ref) : listJobs(dir).map((x) => reconcile(dir, x)).find((x) => x.status !== "running");
   if (j === "ambiguous") { console.error(`Ambiguous job id: ${ref}`); return 1; }
   if (!j) { console.error(ref ? `No job matching ${ref}.` : "No finished Mistral jobs found."); return 1; }
   if (j.status === "running") { console.log(`Job ${j.id} is still running. Check /mistral:status ${j.id}.`); return 0; }
-  console.log(opts.json ? JSON.stringify(j, null, 2) : renderResult(j));
+  console.log(opts.json ? JSON.stringify(j, null, 2) : renderResult(opts.full ? { ...j, brief: false } : j));
   return 0;
 }
 
@@ -450,7 +488,7 @@ function cmdSetup(argv) {
   return 0;
 }
 
-export { classifyOutcome, splitRaw, parseArgs, collectReviewContext, listJobs, saveJob, pruneJobs, findJob, pidIsOurs, MAX_JOBS };
+export { vibeEnv, deepseekEntry, NOISE_RE, renderResult, classifyOutcome, splitRaw, parseArgs, collectReviewContext, listJobs, saveJob, pruneJobs, findJob, pidIsOurs, MAX_JOBS };
 
 // ---------- main ----------
 // Compare real paths: Node resolves the entry point's realpath, so symlinks or Windows case

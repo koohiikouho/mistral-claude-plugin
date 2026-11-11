@@ -120,4 +120,34 @@ test("review rejects an unknown --base instead of reporting nothing to review", 
   assert.throws(() => m.collectReviewContext(dir, { scope: "branch", base: "no-such-ref" }), /Unknown base ref: no-such-ref/);
 });
 
+test("lockfiles and generated files are left out of review context", () => {
+  const dir = repo("noise");
+  fs.writeFileSync(path.join(dir, "package-lock.json"), "LOCKSECRET\n");
+  fs.writeFileSync(path.join(dir, "app.min.js"), "MINSECRET\n");
+  fs.writeFileSync(path.join(dir, "real.txt"), "REALCHANGE\n");
+  spawnSync("git", ["add", "-N", "."], { cwd: dir });
+  const ctx = m.collectReviewContext(dir, { scope: "working-tree" });
+  assert.match(ctx.body, /REALCHANGE/);
+  assert.doesNotMatch(ctx.body, /LOCKSECRET|MINSECRET/);
+  assert.ok(m.NOISE_RE.test("a/b/yarn.lock") && m.NOISE_RE.test("x.min.js") && !m.NOISE_RE.test("src/lock.ts"));
+});
+
+test("deepseek runs force max thinking via VIBE_MODELS; other models are untouched", () => {
+  const e = m.vibeEnv("deepseek@mistral");
+  const models = JSON.parse(e.VIBE_MODELS);
+  assert.equal(models[0].alias, "deepseek@mistral");
+  assert.equal(models[0].thinking, "max");
+  assert.equal(m.vibeEnv("mistral-medium-3.5").VIBE_MODELS, undefined);
+  assert.equal(m.vibeEnv(undefined).VIBE_MODELS, undefined);
+});
+
+test("brief output is capped and points to --full; diff stat is shown", () => {
+  const long = "x".repeat(9000);
+  const out = m.renderResult({ id: "j1", status: "completed", brief: true, output: long, diffStat: " a.txt | 1 +" });
+  assert.ok(out.length < 5000);
+  assert.match(out, /result j1 --full/);
+  assert.match(out, /a.txt/);
+  assert.ok(m.renderResult({ id: "j2", status: "completed", brief: false, output: long }).length > 9000);
+});
+
 test("cleanup", () => { fs.rmSync(tmp, { recursive: true, force: true }); });

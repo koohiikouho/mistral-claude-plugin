@@ -1,6 +1,6 @@
 ---
 description: Show the stored final output for a finished Mistral job
-argument-hint: '[job-id]'
+argument-hint: '[job-id] [--full]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

@@ -1,6 +1,6 @@
 ---
 description: Run a Mistral Vibe code review against local git state
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <alias>] [--context-size <KB>] [--brief]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <alias>] [--brief]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

@@ -4,7 +4,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 
 // A PID that is guaranteed dead: spawn a short-lived child and let it exit.
 const deadPid = (() => { const r = spawnSync(process.execPath, ["-e", ""]); return r.pid; })();
@@ -149,32 +148,6 @@ test("brief output is capped and points to --full; diff stat is shown", () => {
   assert.match(out, /result j1 --full/);
   assert.match(out, /a.txt/);
   assert.ok(m.renderResult({ id: "j2", status: "completed", brief: false, output: long }).length > 9000);
-});
-
-test("review context size is configurable", () => {
-  const dir = repo("ctxsize");
-  fs.writeFileSync(path.join(dir, "big.txt"), "line of text\n".repeat(2000));
-  spawnSync("git", ["add", "-N", "."], { cwd: dir });
-  const small = m.collectReviewContext(dir, { scope: "working-tree", maxBytes: 2000 });
-  const large = m.collectReviewContext(dir, { scope: "working-tree", maxBytes: 200000 });
-  assert.match(small.body, /truncated/);
-  assert.ok(small.body.length < 4000);
-  assert.ok(large.body.length > 20000);
-});
-
-test("review validates --context-size", () => {
-  const dir = repo("ctxcli");
-  const script = fileURLToPath(new URL("../scripts/mistral-companion.mjs", import.meta.url));
-  const run = (v) => spawnSync(process.execPath, [script, "review", "--context-size", v],
-    { cwd: dir, encoding: "utf8", env: { ...process.env, CLAUDE_PLUGIN_DATA: path.join(tmp, "data") } });
-  for (const bad of ["0", "abc", "5000", "-3"]) {
-    const r = run(bad);
-    assert.equal(r.status, 1, bad);
-    assert.match(r.stderr, /Invalid --context-size/);
-  }
-  const ok = run("1"); // valid value: gets past validation (clean repo -> nothing to review)
-  assert.equal(ok.status, 0);
-  assert.match(ok.stdout, /Nothing to review/);
 });
 
 test("cleanup", () => { fs.rmSync(tmp, { recursive: true, force: true }); });

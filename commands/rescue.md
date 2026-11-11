@@ -27,4 +27,4 @@ Operating rules:
 - The subagent is a thin forwarder: one `Bash` call to `mistral-companion.mjs task ...`, stdout returned as-is.
 - Do not paraphrase or add commentary. Do not ask the subagent to poll status, fetch results or cancel.
 - If Vibe is missing or not configured, stop and tell the user to run `/mistral:setup`.
-- If no request was supplied, ask what Mistral should investigate or fix.
+- If no request was supplied, ask what Mistral should investigate or fix. Exception: `--resume-job <job-id>` needs no task text; forward it as-is.

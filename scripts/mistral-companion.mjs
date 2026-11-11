@@ -361,7 +361,13 @@ function runVibe({ cwd, dir, job, tag = "", prompt, write, resumeId, model, maxT
     const p = { turn: 0, maxTurns: maxTurns || null, tokens: null, last: null, notes: [] };
     let tail = resumeId ? journalTail(resumeId, journalSizes(resumeId)) : null;
     const pump = () => {
-      if (!tail) { sid = findSessionId(before, cwd); if (sid) tail = journalTail(sid); }
+      if (!tail) {
+        // Skip sessions another running job in this folder already claimed (two jobs started close together).
+        const taken = new Set(before);
+        for (const o of listJobs(dir)) if (o.id !== job.id && o.status === "running" && o.sessionId) taken.add(o.sessionId);
+        sid = findSessionId(taken, cwd);
+        if (sid) tail = journalTail(sid);
+      }
       if (!tail) return;
       const fwd = cwd.replace(/\\/g, "/"); // Vibe's tools show the folder as C:\x, C:/x or /c/x
       const root = [cwd, fwd, fwd.replace(/^([A-Za-z]):/, (_, d) => `/${d.toLowerCase()}`)];
@@ -689,11 +695,12 @@ async function cmdTask(argv) {
     if (!from) { console.error("No previous Mistral task session to resume. Run without --resume-last."); return 1; }
   }
   if (!task) { console.error("Provide a task description."); return 1; }
-  if (from && opts.model && opts.model !== from.model) console.error(`Note: a resumed session keeps its model${from.model ? ` (${from.model})` : ""}; --model ${opts.model} is ignored.`);
+  // Jobs from before 0.1.15 did not record their model; then --model only sets effort/compaction (Vibe keeps the session's model).
+  if (from?.model && opts.model && opts.model !== from.model) console.error(`Note: a resumed session keeps its model${from.model ? ` (${from.model})` : ""}; --model ${opts.model} is ignored.`);
   const prompt = opts.full ? task : task + BRIEF_TASK_NOTE;
   return runJob({ kind: "task", title: (from && task === CONTINUE_PROMPT ? `Continue ${from.id}: ${from.title}` : task).slice(0, 80), cwd, prompt,
     write: !!opts.write || !!(opts["resume-job"] && from?.write), resumeId: from?.sessionId || null, resumedFrom: from?.id || null,
-    model: from ? from.model || null : opts.model, maxTurns: lim.maxTurns, timeLimit: lim.timeLimit, maxTokens: lim.maxTokens,
+    model: from?.model || opts.model || null, maxTurns: lim.maxTurns, timeLimit: lim.timeLimit, maxTokens: lim.maxTokens,
     json: opts.json, brief: !opts.full, compactAt: ca.value ?? from?.compactAt ?? undefined, effort: ef.value ?? from?.effort ?? undefined, wrapUp: !opts["no-wrap-up"] });
 }
 const CONTINUE_PROMPT = "Continue the task from where you stopped. First check the current state of the files you were working on, then finish the remaining work.";
@@ -898,7 +905,7 @@ export { foldJournal, journalTail, wrapReserve, parseLimits, renderStatus, runFi
 const LIMIT_HELP = `Limits (opt-in for tasks):
   --max-turns <n>     stop after n turns. A turn is one model call; tool calls and hooks are not turns.
   --time-limit <s>    stop after s seconds.
-  --max-tokens <n>    stop when the run has used n tokens (input + output, cached input included).
+  --max-tokens <n>    stop when the run's token total, as Vibe counts it, reaches n.
   --no-wrap-up        with a turn or time limit, the plugin normally keeps a few turns (3-8, about 5%)
                       and up to 5 minutes (about 10%) in reserve. If the run hits the limit, it resumes
                       the session with that reserve and tells the agent to revert debug edits, write any

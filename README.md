@@ -57,7 +57,7 @@ It is a port of the idea behind [openai/codex-plugin-cc](https://github.com/open
 
 ### Rescue options
 - `--resume` / `--fresh`: continue the last Vibe session for this repo, or start a new one.
-- `--resume-job <job-id>`: continue the Vibe session of a specific earlier job, for example one that stopped at a limit. It keeps that job's model, effort and write mode and gets a fresh allowance. The task text is optional; the default tells the agent to check where it was and finish.
+- `--resume-job <job-id>`: continue the Vibe session of a specific earlier job, for example one that stopped at a limit. It keeps that job's model, effort and write mode and gets a fresh allowance. Jobs from before 0.1.15 did not record their model, so pass `--model` again for those (it sets the effort; the session keeps its model). The task text is optional; the default tells the agent to check where it was and finish.
 - `--max-turns <n>`, `--time-limit <seconds>`, `--max-tokens <n>`: opt-in limits (see [Turns and limits](#turns-and-limits)). `--no-wrap-up` turns off the wrap-up reserve.
 - `--model <alias>`: use a specific Vibe model alias.
 - `--effort <level>` and `--compact-at <tokens>`: see below.
@@ -108,7 +108,7 @@ The defaults are tuned for using Vibe alongside Claude:
 
 **What a turn is.** One turn is one model call. Vibe counts it as `steps` in its export, and its session journal records each one as a `completion` with its iteration number. Tool calls, file reads and hooks run inside a turn and do not count. One turn can make several tool calls. We have not yet checked how compaction affects the count (whether its summarizing call is a turn).
 
-**Opt-in limits.** `--max-turns <n>`, `--time-limit <seconds>` and `--max-tokens <n>` are passed to Vibe. `--max-tokens` counts input and output tokens for the run, cached input included. Every turn resends the context, so the total grows fast on long runs.
+**Opt-in limits.** `--max-turns <n>`, `--time-limit <seconds>` and `--max-tokens <n>` are passed to Vibe. `--max-tokens` caps the run's token total as Vibe counts it. Every turn resends the whole context, so the total grows fast on long runs: a 60-turn run used about 2.9 million tokens.
 
 **Wrap-up.** When you set a turn or time limit, the plugin keeps a reserve: 5% of the turns (3 to 8), or 5 turns with only a time limit, and 10% of the time (1 to 5 minutes). The main run gets the limit minus the reserve. If it stops there, the plugin resumes the same session with the reserve and tells the agent to stop investigating, revert temporary debug edits, write any report it was asked for, and summarize. Limits below 10 turns or 300 seconds get no reserve. `--no-wrap-up` turns it off.
 

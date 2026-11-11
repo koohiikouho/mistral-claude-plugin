@@ -1,0 +1,7 @@
+{
+  "name": "mistral-claude-plugin",
+  "version": "0.1.2",
+  "private": true,
+  "license": "Apache-2.0",
+  "scripts": { "test": "node --test \"tests/*.test.mjs\"" }
+}

@@ -71,7 +71,11 @@ function stateDir(cwd) {
 const jobFile = (dir, id) => path.join(dir, `${id}.json`);
 function saveJob(dir, job) {
   job.updatedAt = new Date().toISOString();
-  fs.writeFileSync(jobFile(dir, job.id), JSON.stringify(job, null, 2), { encoding: "utf8", mode: 0o600 });
+  // Atomic write: a reader or a concurrent writer never sees a truncated file.
+  const target = jobFile(dir, job.id);
+  const tmp = `${target}.${process.pid}.${randomBytes(3).toString("hex")}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(job, null, 2), { encoding: "utf8", mode: 0o600 });
+  fs.renameSync(tmp, target);
 }
 function listJobs(dir) {
   const jobs = [];
@@ -86,13 +90,28 @@ function pruneJobs(dir) {
     for (const f of fs.readdirSync(dir)) if (f.startsWith(j.id)) fs.rmSync(path.join(dir, f), { recursive: true, force: true });
   }
 }
-function pidAlive(pid) {
-  if (!pid) return false;
-  try { process.kill(pid, 0); return true; } catch { return false; }
+// Start time (ms since epoch) of a live process, or null if it is gone or unreadable.
+function procStartMs(pid) {
+  if (!pid) return null;
+  const r = IS_WIN
+    ? spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command",
+        `(Get-Process -Id ${Number(pid)} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')`], { encoding: "utf8", windowsHide: true })
+    : spawnSync("ps", ["-o", "lstart=", "-p", String(Number(pid))], { encoding: "utf8" });
+  if (r.error || r.status !== 0) return null;
+  const t = Date.parse((r.stdout || "").trim());
+  return Number.isNaN(t) ? null : t;
+}
+// PID reuse guard: a process that took over a dead job's PID started after the job did.
+const PID_START_SLACK_MS = 5000;
+function pidIsOurs(pid, notAfterIso) {
+  const start = procStartMs(pid);
+  if (start === null) return false;
+  const limit = Date.parse(notAfterIso);
+  return Number.isNaN(limit) ? false : start <= limit + PID_START_SLACK_MS;
 }
 // A "running" job whose companion process died is reported as failed.
 function reconcile(dir, job) {
-  if ((job.status === "running" || job.status === "queued") && !pidAlive(job.companionPid)) {
+  if ((job.status === "running" || job.status === "queued") && !pidIsOurs(job.companionPid, job.createdAt)) {
     job.status = "failed";
     job.error = job.error || "Companion process exited without recording a result.";
     saveJob(dir, job);
@@ -107,11 +126,12 @@ function vibeVersion() {
   if (r.error || r.status !== 0) return null;
   return (r.stdout || "").trim();
 }
-function killTree(pid) {
+// group=true only for children we spawned as process-group leaders (vibe, on POSIX).
+function killTree(pid, { group = false } = {}) {
   if (!pid) return;
   try {
     if (IS_WIN) execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
-    else process.kill(-pid, "SIGKILL");
+    else process.kill(group ? -pid : pid, "SIGKILL");
   } catch { try { process.kill(pid, "SIGKILL"); } catch {} }
 }
 
@@ -128,6 +148,7 @@ function runVibe({ cwd, dir, job, prompt, write, resumeId, model, maxTurns, time
   return new Promise((resolve) => {
     const child = spawn("vibe", args, { cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: !IS_WIN });
     job.vibePid = child.pid;
+    job.vibeSpawnedAt = new Date().toISOString();
     saveJob(dir, job);
     let stdout = "", stderr = "";
     child.stdout.setEncoding("utf8").on("data", (d) => (stdout += d));
@@ -151,7 +172,7 @@ async function runJob({ kind, title, cwd, prompt, write = false, resumeId = null
   };
   saveJob(dir, job);
   pruneJobs(dir);
-  const onSig = () => { killTree(job.vibePid); job.status = "cancelled"; saveJob(dir, job); process.exit(130); };
+  const onSig = () => { killTree(job.vibePid, { group: true }); job.status = "cancelled"; saveJob(dir, job); process.exit(130); };
   process.on("SIGTERM", onSig); process.on("SIGINT", onSig);
 
   const r = await runVibe({ cwd, dir, job, prompt, write, resumeId, model,
@@ -380,8 +401,9 @@ function cmdCancel(argv) {
   if (!j) { console.log(ref ? `No running job matching ${ref}.` : jobs.length ? "Multiple jobs are running; pass a job id." : "No running Mistral jobs."); return 0; }
   j.status = "cancelled"; j.finishedAt = new Date().toISOString();
   saveJob(dir, j);
-  killTree(j.vibePid);
-  killTree(j.companionPid);
+  // Only signal processes whose start time proves they are the ones this job created.
+  if (j.vibePid && pidIsOurs(j.vibePid, j.vibeSpawnedAt || j.createdAt)) killTree(j.vibePid, { group: true });
+  if (j.companionPid && pidIsOurs(j.companionPid, j.createdAt)) killTree(j.companionPid);
   console.log(`Cancelled ${j.id}.`);
   return 0;
 }
@@ -415,8 +437,11 @@ function cmdSetup(argv) {
   return 0;
 }
 
+export { splitRaw, parseArgs, collectReviewContext, listJobs, saveJob, pruneJobs, findJob, pidIsOurs, MAX_JOBS };
+
 // ---------- main ----------
-const [cmd, ...args] = process.argv.slice(2);
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const [cmd, ...args] = isMain ? process.argv.slice(2) : [];
 const table = {
   setup: () => cmdSetup(args),
   review: () => cmdReview(args, false),
@@ -427,8 +452,8 @@ const table = {
   result: () => cmdResult(args),
   cancel: () => cmdCancel(args),
 };
-if (!table[cmd]) {
+if (isMain && !table[cmd]) {
   console.error("Usage: mistral-companion <setup|review|adversarial-review|task|status|result|cancel|task-resume-candidate> [options]");
   process.exit(2);
 }
-Promise.resolve(table[cmd]()).then((c) => process.exit(c ?? 0), (e) => { console.error(e?.stack || String(e)); process.exit(1); });
+if (isMain) Promise.resolve(table[cmd]()).then((c) => process.exit(c ?? 0), (e) => { console.error(e?.stack || String(e)); process.exit(1); });

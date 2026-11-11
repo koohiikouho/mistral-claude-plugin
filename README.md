@@ -74,7 +74,7 @@ DeepSeek models (any alias containing `deepseek`) run at **max reasoning** by de
 
 ### Reasoning effort (`--effort`)
 
-`--effort <level>` sets the model's reasoning (Vibe calls it `thinking`) for one run: `off`, `low`, `medium`, `high`, `xhigh` or `max`. Each model supports its own subset, for example GLM-5.3 takes `low|high|max` and DeepSeek takes all of them. The plugin checks the level against the model and refuses an unsupported one up front instead of letting the API return an error. It needs to know the model, so pass `--model <alias>` unless `active_model` is set in your config. The first use runs one tiny probe call to read Vibe's model list (cached for an hour). DeepSeek defaults to `max` when `--effort` is omitted.
+`--effort <level>` sets the model's reasoning (Vibe calls it `thinking`) for one run: `off`, `low`, `medium`, `high`, `xhigh` or `max`. Each model supports its own subset, for example GLM-5.3 takes `low|high|max`. The plugin checks the level against the model and refuses an unsupported one up front instead of letting the API return an error. It needs to know the model, so pass `--model <alias>` unless `active_model` is set in your config. The first use runs one tiny probe call to read Vibe's model list (cached for an hour). DeepSeek defaults to `max` when `--effort` is omitted.
 
 ```
 /mistral:review --model glm-5-3 --effort low

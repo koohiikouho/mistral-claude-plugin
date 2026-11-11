@@ -165,12 +165,66 @@ function deepseekEntry(model) {
 }
 // compactAt: token count at which Vibe compacts the session. The global setting only reaches models that
 // have no threshold of their own, so it is also written into the DeepSeek entry (whose entry we control).
-function vibeEnv(model, compactAt) {
+// effortEntry: a full model entry (name, provider, alias) with the requested thinking level, from resolveEffort.
+function vibeEnv(model, compactAt, effortEntry) {
   const e = deepseekEntry(model);
   const env = { ...process.env };
   if (compactAt) env.VIBE_AUTO_COMPACT_THRESHOLD = String(compactAt);
-  if (e) env.VIBE_MODELS = JSON.stringify([{ ...e, thinking: "max", ...(compactAt ? { auto_compact_threshold: compactAt } : {}) }]);
+  const entry = e ? { ...e, thinking: "max" } : effortEntry ? { ...effortEntry } : null;
+  if (entry) env.VIBE_MODELS = JSON.stringify([{ ...entry, ...(compactAt ? { auto_compact_threshold: compactAt } : {}) }]);
   return env;
+}
+
+// ---------- effort (Vibe's per-model "thinking" level) ----------
+const EFFORT_LEVELS = ["off", "low", "medium", "high", "xhigh", "max"];
+const MODEL_INFO_TTL_MS = 3600_000;
+function dataBase() {
+  return process.env.CLAUDE_PLUGIN_DATA ? path.join(process.env.CLAUDE_PLUGIN_DATA, "state") : path.join(os.homedir(), ".cache", "mistral-companion");
+}
+// Vibe has no flag for reasoning effort, and an override needs the model's full entry plus the levels it supports.
+// Read both from the effective config of a tiny probe run, and cache them for an hour.
+function loadModelInfo() {
+  const file = path.join(dataBase(), "models.json");
+  try {
+    const c = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (Date.now() - c.at < MODEL_INFO_TTL_MS) return c;
+  } catch {}
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mistral-probe-"));
+  try {
+    fs.writeFileSync(path.join(tmp, "p.txt"), "Reply with exactly: ok", "utf8");
+    spawnSync("vibe", ["--prompt-file", path.join(tmp, "p.txt"), "--agent", "ask", "--max-turns", "1", "--time-limit", "60",
+      "--output-dir", path.join(tmp, "out"), "--workdir", tmp], { encoding: "utf8", timeout: 90000, windowsHide: true });
+    const cfg = JSON.parse(fs.readFileSync(path.join(tmp, "out", "export.json"), "utf8")).config;
+    const info = { at: Date.now(), active: cfg.active_model || "", models: cfg.models || {} };
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, JSON.stringify(info), { encoding: "utf8", mode: 0o600 });
+    return info;
+  } catch { return null; }
+  finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+}
+function parseEffort(raw) {
+  if (raw === undefined) return { value: undefined };
+  const v = String(raw).toLowerCase();
+  return EFFORT_LEVELS.includes(v) ? { value: v } : { error: `Invalid --effort "${raw}". Use one of: ${EFFORT_LEVELS.join(", ")}.` };
+}
+// Returns { entry?, note?, error? }. `info` is injectable for tests.
+function resolveEffort(model, effort, info) {
+  if (!effort) return {};
+  if (deepseekEntry(model)) return { note: effort === "max" ? null : `DeepSeek always runs at max reasoning; ignoring --effort ${effort}.` };
+  info = info === undefined ? loadModelInfo() : info;
+  if (!info) return { error: "Could not read Vibe's model list to apply --effort. Check that `vibe` runs (try /mistral:setup)." };
+  const alias = model || info.active;
+  if (!alias) return { error: "--effort needs a specific model. Pass --model <alias> (or set active_model in ~/.vibe/config.toml)." };
+  if (/deepseek/i.test(alias)) { // any DeepSeek alias is forced to max, even one the plugin does not know by name
+    const known = info.models[alias];
+    const note = "DeepSeek always runs at max reasoning" + (effort === "max" ? "." : "; ignoring --effort " + effort + ".");
+    return known ? { entry: { name: known.name, provider: known.provider, alias, thinking: "max" }, note } : { note };
+  }
+  const m = info.models[alias];
+  if (!m) return { error: `Unknown model "${alias}" for --effort. Known models: ${Object.keys(info.models).join(", ") || "(none)"}.` };
+  const levels = m.thinking_levels || [];
+  if (!levels.includes(effort)) return { error: `Model ${alias} supports --effort: ${levels.join(", ") || "(none)"}. Got "${effort}".` };
+  return { entry: { name: m.name, provider: m.provider, alias, thinking: effort } };
 }
 const MIN_COMPACT_AT = 1000;
 const MAX_COMPACT_AT = 10_000_000;
@@ -183,7 +237,7 @@ function parseCompactAt(raw) {
   return { value: n };
 }
 
-function runVibe({ cwd, dir, job, prompt, write, resumeId, model, maxTurns, timeLimit, compactAt }) {
+function runVibe({ cwd, dir, job, prompt, write, resumeId, model, maxTurns, timeLimit, compactAt, effortEntry }) {
   const promptFile = path.join(dir, `${job.id}.prompt.txt`);
   const outDir = path.join(dir, `${job.id}.out`);
   fs.writeFileSync(promptFile, prompt, { encoding: "utf8", mode: 0o600 });
@@ -194,7 +248,7 @@ function runVibe({ cwd, dir, job, prompt, write, resumeId, model, maxTurns, time
   if (model) args.push("--model", model);
 
   return new Promise((resolve) => {
-    const child = spawn("vibe", args, { cwd, env: vibeEnv(model, compactAt), stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: !IS_WIN });
+    const child = spawn("vibe", args, { cwd, env: vibeEnv(model, compactAt, effortEntry), stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: !IS_WIN });
     job.vibePid = child.pid;
     job.vibeSpawnedAt = new Date().toISOString();
     saveJob(dir, job);
@@ -210,7 +264,10 @@ function runVibe({ cwd, dir, job, prompt, write, resumeId, model, maxTurns, time
   });
 }
 
-async function runJob({ kind, title, cwd, prompt, write = false, resumeId = null, model = null, maxTurns, timeLimit, json, brief = false, compactAt }) {
+async function runJob({ kind, title, cwd, prompt, write = false, resumeId = null, model = null, maxTurns, timeLimit, json, brief = false, compactAt, effort }) {
+  const eff = resolveEffort(model, effort);
+  if (eff.error) { console.error(eff.error); return 1; }
+  if (eff.note) console.error(eff.note);
   const dir = stateDir(cwd);
   const job = {
     id: `${kind}-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`,
@@ -223,7 +280,7 @@ async function runJob({ kind, title, cwd, prompt, write = false, resumeId = null
   const onSig = () => { killTree(job.vibePid, { group: true }); job.status = "cancelled"; saveJob(dir, job); process.exit(130); };
   process.on("SIGTERM", onSig); process.on("SIGINT", onSig);
 
-  const r = await runVibe({ cwd, dir, job, prompt, write, resumeId, model, compactAt,
+  const r = await runVibe({ cwd, dir, job, prompt, write, resumeId, model, compactAt, effortEntry: eff.entry,
     maxTurns: maxTurns || DEFAULT_MAX_TURNS, timeLimit: timeLimit || DEFAULT_TIME_LIMIT });
 
   const fresh = (() => { try { return JSON.parse(fs.readFileSync(jobFile(dir, job.id), "utf8")); } catch { return job; } })();
@@ -348,11 +405,13 @@ function collectReviewContext(cwd, { scope, base }) {
 function loadPrompt(name) { return fs.readFileSync(path.join(ROOT, "prompts", `${name}.md`), "utf8"); }
 
 async function cmdReview(argv, adversarial) {
-  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["base", "scope", "model", "max-turns", "time-limit", "compact-at"], boolFlags: ["wait", "background", "json", "brief"] });
+  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["base", "scope", "model", "max-turns", "time-limit", "compact-at", "effort"], boolFlags: ["wait", "background", "json", "brief"] });
   const cwd = process.cwd();
   if (!git(["rev-parse", "--is-inside-work-tree"], cwd).ok) { console.error("Not inside a git repository."); return 1; }
   const ca = parseCompactAt(opts["compact-at"]);
   if (ca.error) { console.error(ca.error); return 1; }
+  const ef = parseEffort(opts.effort);
+  if (ef.error) { console.error(ef.error); return 1; }
   let ctx;
   try { ctx = collectReviewContext(cwd, { scope: opts.scope, base: opts.base }); }
   catch (e) { console.error(e.message); return 1; }
@@ -364,7 +423,7 @@ async function cmdReview(argv, adversarial) {
     .replace("{{FOCUS}}", () => focus || "(none)")
     .replace("{{CONTEXT}}", () => ctx.body) + (opts.brief ? BRIEF_REVIEW_NOTE : "");
   return runJob({ kind: adversarial ? "adversarial-review" : "review", title: `${adversarial ? "Adversarial review" : "Review"}: ${ctx.target}`,
-    cwd, prompt, write: false, model: opts.model, maxTurns: num(opts["max-turns"]) || DEFAULT_REVIEW_TURNS, timeLimit: num(opts["time-limit"]), json: opts.json, brief: !!opts.brief, compactAt: ca.value });
+    cwd, prompt, write: false, model: opts.model, maxTurns: num(opts["max-turns"]) || DEFAULT_REVIEW_TURNS, timeLimit: num(opts["time-limit"]), json: opts.json, brief: !!opts.brief, compactAt: ca.value, effort: ef.value });
 }
 const BRIEF_REVIEW_NOTE = [
   "", "", "## Brevity (token budget)",
@@ -374,11 +433,13 @@ const num = (v) => (v === undefined ? undefined : Number(v));
 
 // ---------- task ----------
 async function cmdTask(argv) {
-  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["model", "max-turns", "time-limit", "compact-at"],
+  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["model", "max-turns", "time-limit", "compact-at", "effort"],
     boolFlags: ["write", "resume-last", "fresh", "background", "wait", "json", "full"] });
   const cwd = process.cwd();
   const ca = parseCompactAt(opts["compact-at"]);
   if (ca.error) { console.error(ca.error); return 1; }
+  const ef = parseEffort(opts.effort);
+  if (ef.error) { console.error(ef.error); return 1; }
   const task = rest.join(" ").trim();
   if (!task) { console.error("Provide a task description."); return 1; }
   let resumeId = null;
@@ -389,7 +450,7 @@ async function cmdTask(argv) {
   }
   const prompt = opts.full ? task : task + BRIEF_TASK_NOTE;
   return runJob({ kind: "task", title: task.slice(0, 80), cwd, prompt, write: !!opts.write, resumeId,
-    model: opts.model, maxTurns: num(opts["max-turns"]), timeLimit: num(opts["time-limit"]), json: opts.json, brief: !opts.full, compactAt: ca.value });
+    model: opts.model, maxTurns: num(opts["max-turns"]), timeLimit: num(opts["time-limit"]), json: opts.json, brief: !opts.full, compactAt: ca.value, effort: ef.value });
 }
 const BRIEF_TASK_NOTE = "\n\n(Token budget: when finished, reply with a short summary only — what you changed and why, under 150 words. Do not paste code or diffs.)";
 function resumeCandidate(cwd) {
@@ -507,7 +568,7 @@ function cmdSetup(argv) {
   return 0;
 }
 
-export { parseCompactAt, vibeEnv, deepseekEntry, NOISE_RE, renderResult, classifyOutcome, splitRaw, parseArgs, collectReviewContext, listJobs, saveJob, pruneJobs, findJob, pidIsOurs, MAX_JOBS };
+export { parseEffort, resolveEffort, parseCompactAt, vibeEnv, deepseekEntry, NOISE_RE, renderResult, classifyOutcome, splitRaw, parseArgs, collectReviewContext, listJobs, saveJob, pruneJobs, findJob, pidIsOurs, MAX_JOBS };
 
 // ---------- main ----------
 // Compare real paths: Node resolves the entry point's realpath, so symlinks or Windows case

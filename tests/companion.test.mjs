@@ -163,4 +163,31 @@ test("--compact-at is validated and reaches the vibe environment", () => {
   assert.equal(ds.VIBE_AUTO_COMPACT_THRESHOLD, "60000");
 });
 
+test("--effort is validated and resolved against the model's levels", () => {
+  assert.equal(m.parseEffort(undefined).value, undefined);
+  assert.equal(m.parseEffort("HIGH").value, "high");
+  assert.match(m.parseEffort("turbo").error, /Invalid --effort/);
+  const info = { active: "", models: { "glm-5-3": { name: "zai-glm-5-3", provider: "mistral", thinking_levels: ["low", "high", "max"] } } };
+  const ok = m.resolveEffort("glm-5-3", "low", info);
+  assert.deepEqual(ok.entry, { name: "zai-glm-5-3", provider: "mistral", alias: "glm-5-3", thinking: "low" });
+  assert.match(m.resolveEffort("glm-5-3", "xhigh", info).error, /supports --effort: low, high, max/);
+  assert.match(m.resolveEffort("nope", "low", info).error, /Unknown model/);
+  assert.match(m.resolveEffort(undefined, "low", info).error, /needs a specific model/);
+  assert.match(m.resolveEffort("glm-5-3", "low", null).error, /Could not read/);
+  assert.deepEqual(m.resolveEffort("glm-5-3", undefined, info), {});
+  assert.equal(m.resolveEffort("deepseek@mistral", "low", info).entry, undefined);
+  assert.match(m.resolveEffort("deepseek@mistral", "low", info).note, /always runs at max/);
+  const dsActive = m.resolveEffort(undefined, "low", { active: "deepseek@mistral", models: {} });
+  assert.equal(dsActive.entry, undefined); // alias unknown to the model list: note only
+  const dsKnown = m.resolveEffort(undefined, "low", { active: "deepseek-x@mistral", models: { "deepseek-x@mistral": { name: "ds-x", provider: "mistral", thinking_levels: ["off", "low", "max"] } } });
+  assert.equal(dsKnown.entry.thinking, "max");
+  assert.equal(dsKnown.entry.name, "ds-x");
+  assert.match(dsActive.note, /always runs at max/);
+  const env = m.vibeEnv("glm-5-3", 50000, ok.entry);
+  const e = JSON.parse(env.VIBE_MODELS)[0];
+  assert.equal(e.thinking, "low");
+  assert.equal(e.auto_compact_threshold, 50000);
+  assert.equal(m.vibeEnv("deepseek@mistral", undefined, ok.entry).VIBE_MODELS.includes('"thinking":"max"'), true);
+});
+
 test("cleanup", () => { fs.rmSync(tmp, { recursive: true, force: true }); });

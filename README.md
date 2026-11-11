@@ -48,6 +48,7 @@ It is a port of the idea behind [openai/codex-plugin-cc](https://github.com/open
 - `--scope auto|working-tree|branch`: `auto` reviews your uncommitted changes if there are any, otherwise the current branch against its base.
 - `--base <ref>`: the branch to diff against (defaults to `origin/HEAD`, then `main` or `master`).
 - `--model <alias>`: run the review with a specific Vibe model (see below).
+- `--effort <level>`: reasoning effort (`off|low|medium|high|xhigh|max`); see below.
 - `--compact-at <tokens>`: token count at which Vibe compacts (summarizes) the session; see below.
 - `--wait` / `--background`: run in the foreground (the default), or as a Claude Code background task.
 - `--brief`: ask for a short review (top 7 findings, one line each; printed output capped). Reviews are full-length by default.
@@ -55,7 +56,7 @@ It is a port of the idea behind [openai/codex-plugin-cc](https://github.com/open
 ### Rescue options
 - `--resume` / `--fresh`: continue the last Vibe session for this repo, or start a new one.
 - `--model <alias>`: use a specific Vibe model alias.
-- `--compact-at <tokens>`: see below.
+- `--effort <level>` and `--compact-at <tokens>`: see below.
 - `--background` / `--wait`: as above.
 
 Rescue runs go through the `mistral:mistral-rescue` subagent. Claude can also call that subagent on its own when it is stuck.
@@ -71,9 +72,17 @@ The plugin passes `--model <alias>` straight to `vibe`, so any model alias Vibe 
 
 DeepSeek models (any alias containing `deepseek`) always run at **max reasoning**. Vibe has no flag for this, so the plugin sets it for that run only through the `VIBE_MODELS` environment variable; your config files are not touched. If you set `active_model` to a DeepSeek alias in `config.toml` and omit `--model`, pass `--model` anyway to get max reasoning.
 
+### Reasoning effort (`--effort`)
+
+`--effort <level>` sets the model's reasoning (Vibe calls it `thinking`) for one run: `off`, `low`, `medium`, `high`, `xhigh` or `max`. Each model supports its own subset, for example GLM-5.3 takes `low|high|max` and DeepSeek takes all of them. The plugin checks the level against the model and refuses an unsupported one up front instead of letting the API return an error. It needs to know the model, so pass `--model <alias>` unless `active_model` is set in your config. The first use runs one tiny probe call to read Vibe's model list (cached for an hour). DeepSeek is always forced to `max` and ignores `--effort`.
+
+```
+/mistral:review --model glm-5-3 --effort low
+```
+
 ### Compaction (`--compact-at`)
 
-`--compact-at <tokens>` (1000 to 10000000) sets how large a session's context may grow before Vibe compacts it. Lower values compact sooner and keep long runs cheaper; higher values keep more history. It does not enlarge the model's context window: Vibe moves a threshold the window cannot support back into range, with a warning. The plugin sets it with the `VIBE_AUTO_COMPACT_THRESHOLD` environment variable, which Vibe applies only to models that have no threshold of their own. DeepSeek is always covered. For another model that already carries its own threshold (several catalog models do), set `auto_compact_threshold` for that model in `~/.vibe/config.toml` instead.
+`--compact-at <tokens>` (1000 to 10000000) sets how large a session's context may grow before Vibe compacts it. Lower values compact sooner and keep long runs cheaper; higher values keep more history. It does not enlarge the model's context window: Vibe moves a threshold the window cannot support back into range, with a warning. The plugin sets it with the `VIBE_AUTO_COMPACT_THRESHOLD` environment variable, which Vibe applies only to models that have no threshold of their own. DeepSeek, and any model run with `--effort`, is always covered. For another model that already carries its own threshold (several catalog models do), set `auto_compact_threshold` for that model in `~/.vibe/config.toml` instead.
 
 To change the default for every command, set `active_model` in `~/.vibe/config.toml`. `--model` only applies to new sessions; a resumed rescue session keeps its original model.
 

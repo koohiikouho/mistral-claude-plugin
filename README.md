@@ -1,34 +1,87 @@
 # Mistral plugin for Claude Code
 
-Use [Mistral Vibe](https://docs.mistral.ai/) from inside Claude Code to review code or delegate tasks.
-Inspired by [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc). Wraps the headless `vibe` CLI.
+Use [Mistral Vibe](https://docs.mistral.ai/) from inside Claude Code to get a second opinion on your code or hand a task off to Vibe.
+
+It is a port of the idea behind [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) for the `vibe` CLI. The plugin is a thin wrapper around headless `vibe` runs, so anything Vibe is configured to do (model, API key, MCP servers) carries over.
 
 ## Requirements
-- Claude Code, Node 18.18+, and `vibe` on your PATH (configured via `vibe --setup`).
+- [Claude Code](https://claude.com/claude-code)
+- Node.js 18.18 or newer
+- The `vibe` CLI on your `PATH`, with an API key configured (`vibe --setup`)
 
 ## Install
+
 ```
-/plugin marketplace add <path-or-github-url-of-this-repo>
+/plugin marketplace add koohiikouho/mistral-claude-plugin
 /plugin install mistral@mistral-vibe
 /reload-plugins
 /mistral:setup
 ```
 
+`/mistral:setup` runs a tiny headless Vibe call and tells you whether everything works. If it fails, run `!vibe --setup` and try again.
+
 ## Commands
+
 | Command | What it does |
 |---|---|
-| `/mistral:review` | Read-only review of working-tree or branch changes (`--base`, `--scope`, `--wait`, `--background`) |
-| `/mistral:adversarial-review [focus]` | Review that challenges design and assumptions |
-| `/mistral:rescue [task]` | Hand a task to Vibe via the `mistral:mistral-rescue` subagent (write-capable; `--resume`/`--fresh`, `--model`) |
-| `/mistral:status [id]` | Show jobs |
-| `/mistral:result [id]` | Show a finished job's output |
-| `/mistral:cancel [id]` | Kill a running job |
-| `/mistral:setup` | Check Vibe is installed and can run headless |
+| `/mistral:review` | Read-only review of your working tree or a branch diff |
+| `/mistral:adversarial-review [focus]` | A review that challenges the design, assumptions and failure modes |
+| `/mistral:rescue [task]` | Hand a debugging or implementation task to Vibe |
+| `/mistral:status [job-id]` | List jobs for this repo, or show one |
+| `/mistral:result [job-id]` | Show the stored output of a finished job |
+| `/mistral:cancel [job-id]` | Stop a running job |
+| `/mistral:setup` | Check that Vibe is installed and can run headless |
+
+### Examples
+
+```
+/mistral:review
+/mistral:review --base main --background
+/mistral:adversarial-review --scope branch look for race conditions and retry storms
+/mistral:rescue --write investigate why the integration test is flaky
+/mistral:rescue --resume apply the top fix
+/mistral:status
+/mistral:result
+```
+
+### Review options
+- `--scope auto|working-tree|branch`: `auto` reviews your uncommitted changes if there are any, otherwise the current branch against its base.
+- `--base <ref>`: the branch to diff against (defaults to `origin/HEAD`, then `main` or `master`).
+- `--wait` / `--background`: run in the foreground, or as a Claude Code background task. Without either, Claude asks based on the size of the change.
+
+### Rescue options
+- `--resume` / `--fresh`: continue the last Vibe session for this repo, or start a new one.
+- `--model <alias>`: use a specific Vibe model alias.
+- `--background` / `--wait`: as above.
+
+Rescue runs go through the `mistral:mistral-rescue` subagent. Claude can also call that subagent on its own when it is stuck.
 
 ## How it works
-Reviews run `vibe --agent ask` (read tools allowed, writes denied) with the diff (including untracked files, size-capped) in the prompt. Rescue runs use `--auto-approve`, so Vibe may edit files and run commands. Prompts go through `--prompt-file`; the stop reason and token usage come from the `--output-dir` export. Runs stopped by a turn or time limit are shown as **partial**. Jobs have a default 30 min / 60 turn cap.
 
-## Not included (vs. the Codex plugin)
-Stop-time review gate and session transfer; structured JSON review output (Vibe has no output-schema flag, so reviews are Markdown).
+- **Reviews** run `vibe --agent ask`. Vibe can read files but its write and shell tools are denied. The diff, including untracked files (size-capped), is placed in the prompt.
+- **Rescue** runs use `vibe --auto-approve`, which lets Vibe edit files and run commands without asking. A headless run cannot answer approval prompts, so there is no in-between mode. Only use rescue in repositories where you are comfortable with that.
+- Prompts are passed with `--prompt-file`, so large diffs do not hit command-line limits.
+- Each run is recorded as a job under the plugin data directory (`~/.cache/mistral-companion` if run outside Claude Code). Stop reason, token usage and session id come from Vibe's `--output-dir` export.
+- Runs stopped by a turn or time limit are shown as **partial** instead of success. Jobs default to a 30 minute and 60 turn cap.
+- `/mistral:cancel` kills the whole Vibe process tree.
 
-License: Apache-2.0 (see NOTICE).
+## Differences from the Codex plugin
+- No stop-time review gate and no session transfer.
+- Reviews are returned as Markdown, not structured JSON, because Vibe has no output-schema option.
+
+## Development
+
+The runtime is one dependency-free file, `scripts/mistral-companion.mjs`. You can drive it directly:
+
+```
+node scripts/mistral-companion.mjs setup
+node scripts/mistral-companion.mjs review --scope working-tree
+node scripts/mistral-companion.mjs task --write "do the thing"
+node scripts/mistral-companion.mjs status
+```
+
+Validate the manifests with `claude plugin validate .`.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). The command layout and job model follow `openai/codex-plugin-cc` (Apache-2.0, Copyright 2026 OpenAI).

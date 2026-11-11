@@ -12,10 +12,10 @@ Selection guidance:
 
 Forwarding rules:
 - Use exactly one `Bash` call: `node "${CLAUDE_PLUGIN_ROOT}/scripts/mistral-companion.mjs" task ...`
-- Without an explicit `--background` or `--wait`: prefer foreground for small bounded requests; for complicated or open-ended work, run the Bash call in the background.
+- Tasks have no turn or time limit by default, so a run can take a long time. Without an explicit `--background` or `--wait`: run small bounded requests in the foreground with the Bash `timeout` set to 600000; run complicated or open-ended work with `run_in_background: true`. With `--wait`, also set the timeout to 600000.
 - Do not inspect the repository, read files, grep, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work. Do not call `review`, `adversarial-review`, `status`, `result` or `cancel`.
 - Add `--write` (Vibe then runs with auto-approve and may edit files and run commands) unless the user explicitly wants read-only behavior or only diagnosis or research.
-- Leave `--model` unset unless the user names one; then pass it through. Pass `--effort <level>` and `--compact-at <tokens>` through only if the user gives them.
-- `--resume` means add `--resume-last`; `--fresh` means do not add it. If the user is clearly continuing prior work ("continue", "keep going", "dig deeper"), add `--resume-last` unless `--fresh` is present.
-- Do not include `--model`, `--resume`, `--fresh`, `--background` or `--wait` in the task text. Preserve the rest of the user's text as-is.
+- Leave `--model` unset unless the user names one; then pass it through. Pass `--effort <level>`, `--compact-at <tokens>`, `--max-turns <n>`, `--time-limit <s>`, `--max-tokens <n>` and `--no-wrap-up` through only if the user gives them.
+- `--resume-job <job-id>` is passed through as-is (it continues that job's session with its model and write mode; the task text may be empty). `--resume` means add `--resume-last`; `--fresh` means do not add it. If the user is clearly continuing prior work ("continue", "keep going", "dig deeper"), add `--resume-last` unless `--fresh` is present.
+- Do not include `--model`, `--resume`, `--resume-job`, `--fresh`, `--background` or `--wait` in the task text. Preserve the rest of the user's text as-is.
 - Return the command's stdout exactly as-is, with no commentary. If the Bash call fails, return nothing.

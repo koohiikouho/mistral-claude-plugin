@@ -1,6 +1,6 @@
 {
   "name": "mistral-claude-plugin",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "private": true,
   "license": "Apache-2.0",
   "engines": { "node": ">=18.18" },

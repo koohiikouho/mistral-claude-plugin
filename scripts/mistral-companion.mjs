@@ -21,9 +21,10 @@ const NOISE_PATHSPECS = ["*package-lock.json", "*npm-shrinkwrap.json", "*yarn.lo
   .map((p) => `:(exclude)${p}`);
 const NOISE_RE = /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|go\.sum)$|\.(lock|min\.js|min\.css|map|snap)$/;
 const MAX_UNTRACKED_FILE_BYTES = 40_000;
-const DEFAULT_TIME_LIMIT = 1800; // seconds
-const DEFAULT_MAX_TURNS = 60;
+// Tasks run without plugin limits, like a Codex rescue or a subagent: Vibe's own cap (1000 turns) applies.
+// Reviews are bounded, because a review that runs long is usually exploring, not reviewing.
 const DEFAULT_REVIEW_TURNS = 15;
+const DEFAULT_REVIEW_TIME_LIMIT = 1800; // seconds
 const IS_WIN = process.platform === "win32";
 
 // ---------- args ----------
@@ -237,12 +238,13 @@ function parseCompactAt(raw) {
   return { value: n };
 }
 
-// ---------- activity tracking (Vibe's session journal) ----------
-// A hung tool call leaves no output until the run ends, so poll the session journal and record the last
-// action and when it happened. Vibe's --time-limit does end a stuck run; the watchdog is only a backstop
-// that kills the process tree if Vibe has still not exited a grace period after the limit.
+// ---------- run progress (Vibe's session journal) ----------
+// Vibe prints nothing until a run ends, so the companion tails the session journal: it records the turn
+// number, token total and last action on the job, and writes one line per tool call to <job>.log.
+// Vibe's --time-limit does end a stuck run; the watchdog is only a backstop that kills the process tree
+// if Vibe has still not exited a grace period after the limit.
 const HANG_GRACE_S = Number(process.env.MISTRAL_HANG_GRACE_S) || 120; // env override is for testing the watchdog
-const ACTIVITY_POLL_MS = Number(process.env.MISTRAL_ACTIVITY_POLL_MS) || 10_000;
+const ACTIVITY_POLL_MS = Number(process.env.MISTRAL_ACTIVITY_POLL_MS) || 5_000;
 function sessionRoot() { return path.join(process.env.VIBE_HOME || path.join(os.homedir(), ".vibe"), "logs", "session", "unified"); }
 function listSessionIds() { try { return fs.readdirSync(sessionRoot()); } catch { return []; } }
 const normPath = (p) => String(p || "").replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
@@ -257,41 +259,97 @@ function findSessionId(before, cwd) {
   }
   return null;
 }
-// Returns { label, at } for the newest journal record of a session, or null.
-function journalActivity(sessionId) {
-  try {
-    const jd = path.join(sessionRoot(), sessionId, "journal");
-    const files = fs.readdirSync(jd).filter((f) => f.endsWith(".jsonl")).sort();
-    if (!files.length) return null;
-    const f = path.join(jd, files[files.length - 1]);
-    const st = fs.statSync(f);
-    const len = Math.min(st.size, 1 << 20);
-    const buf = Buffer.alloc(len);
-    const fd = fs.openSync(f, "r");
-    try { fs.readSync(fd, buf, 0, len, st.size - len); } finally { fs.closeSync(fd); }
-    const lines = buf.toString("utf8").split("\n").filter(Boolean);
-    let label = "activity";
-    for (let i = lines.length - 1; i >= 0 && i >= lines.length - 5; i--) {
-      try {
-        const p = JSON.parse(lines[i]);
-        const e = p.payload?.delta?.[0]?.entry;
-        const t = e?.detail?.display?.statusText || (p.payload?.kind ? p.payload.kind + (p.payload.request?.call?.name ? " " + p.payload.request.call.name : "") : null);
-        if (t) { label = String(t).slice(0, 120); break; }
-      } catch {}
+const journalDir = (sid) => path.join(sessionRoot(), sid, "journal");
+function journalSizes(sid) {
+  const m = new Map();
+  try { for (const f of fs.readdirSync(journalDir(sid))) if (f.endsWith(".jsonl")) m.set(f, fs.statSync(path.join(journalDir(sid), f)).size); } catch {}
+  return m;
+}
+// Returns a reader that yields the complete new records in every journal segment since its last call.
+// Each run of a session (a resume, too) writes a new segment, and the newest one can be empty.
+function journalTail(sid, start = new Map()) {
+  const offsets = new Map(start), rest = new Map();
+  return () => {
+    const out = [];
+    let files = [];
+    try { files = fs.readdirSync(journalDir(sid)).filter((f) => f.endsWith(".jsonl")).sort(); } catch { return out; }
+    for (const f of files) {
+      const p = path.join(journalDir(sid), f);
+      let size;
+      try { size = fs.statSync(p).size; } catch { continue; }
+      const off = offsets.get(f) || 0;
+      if (size <= off) continue;
+      const buf = Buffer.alloc(size - off);
+      const fd = fs.openSync(p, "r");
+      try { fs.readSync(fd, buf, 0, buf.length, off); } finally { fs.closeSync(fd); }
+      offsets.set(f, size);
+      let data = rest.has(f) ? Buffer.concat([rest.get(f), buf]) : buf;
+      for (let nl = data.indexOf(10); nl >= 0; nl = data.indexOf(10)) {
+        const line = data.subarray(0, nl).toString("utf8");
+        data = data.subarray(nl + 1);
+        if (line.trim()) try { out.push(JSON.parse(line)); } catch {}
+      }
+      rest.set(f, data);
     }
-    return { label, at: st.mtime.toISOString() };
-  } catch { return null; }
+    return out;
+  };
+}
+const oneLine = (s, n = 100) => { const t = String(s ?? "").replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
+function callSummary(call) {
+  const a = call?.arguments || {};
+  const v = a.command ?? a.path ?? a.pattern ?? a.query ?? a.url ?? Object.values(a).find((x) => typeof x === "string");
+  return oneLine(v ?? "", 100);
+}
+// Folds journal records into p ({ turn, maxTurns, tokens, last, notes }) and returns new log lines.
+// A turn is one model call: each "completion" action carries its iteration and the run's max_iterations.
+function foldJournal(p, recs) {
+  const lines = [];
+  for (const r of recs) {
+    const pl = r?.payload || {};
+    if (r?.type === "action_intent") {
+      const req = pl.request || {};
+      if (pl.kind === "completion") {
+        p.turn = (Number(req.iteration) || 0) + 1;
+        if (req.max_iterations) p.maxTurns = req.max_iterations;
+      } else if (req.call?.name) {
+        const s = callSummary(req.call);
+        p.last = oneLine(`${req.call.name} ${s}`, 120);
+        lines.push(`turn ${p.turn || 1} · ${req.call.name}${s ? ` · ${s}` : ""}`);
+      }
+    } else if (r?.type === "projection_delta") {
+      for (const d of pl.delta || []) {
+        const t = d.op === "set_envelope" ? d.state?.session?.tokenUsage?.totalTokens : undefined;
+        if (Number.isFinite(t)) p.tokens = t;
+        const e = d.entry;
+        if ((d.op === "append_entry" || d.op === "replace_entry") && e && (e.type === "reasoning" || (e.type === "message" && e.role === "assistant"))) {
+          const text = (e.type === "reasoning" ? e.text : (e.content || []).map((c) => c?.text || "").join("")) || "";
+          if (!text.trim()) continue;
+          p.notes = (p.notes || []).filter((n) => n.id !== e.id);
+          p.notes.push({ id: e.id, kind: e.type === "reasoning" ? "reasoning" : "message", text: text.trim() });
+          p.notes = p.notes.slice(-3);
+        }
+      }
+    }
+  }
+  return lines;
+}
+function appendLog(file, lines) {
+  if (!file || !lines.length) return;
+  const t = new Date().toISOString().slice(11, 19);
+  try { fs.appendFileSync(file, lines.map((l) => `${t} ${l}\n`).join(""), "utf8"); } catch {}
 }
 
-function runVibe({ cwd, dir, job, prompt, write, resumeId, model, maxTurns, timeLimit, compactAt, effortEntry }) {
-  const promptFile = path.join(dir, `${job.id}.prompt.txt`);
-  const outDir = path.join(dir, `${job.id}.out`);
+function runVibe({ cwd, dir, job, tag = "", prompt, write, resumeId, model, maxTurns, timeLimit, maxTokens, compactAt, effortEntry }) {
+  const promptFile = path.join(dir, `${job.id}${tag}.prompt.txt`);
+  const outDir = path.join(dir, `${job.id}${tag}.out`);
   fs.writeFileSync(promptFile, prompt, { encoding: "utf8", mode: 0o600 });
-  const args = ["--prompt-file", promptFile, "--output-dir", outDir, "--workdir", cwd,
-    "--max-turns", String(maxTurns), "--time-limit", String(timeLimit)];
+  const args = ["--prompt-file", promptFile, "--output-dir", outDir, "--workdir", cwd];
+  if (maxTurns) args.push("--max-turns", String(maxTurns));
+  if (timeLimit) args.push("--time-limit", String(timeLimit));
+  if (maxTokens) args.push("--max-tokens", String(maxTokens));
   args.push(write ? "--auto-approve" : "--agent", ...(write ? [] : ["ask"]));
   if (resumeId) args.push("--resume", resumeId);
-  if (model) args.push("--model", model);
+  else if (model) args.push("--model", model); // Vibe refuses --model on a resumed session; the session keeps its model
 
   return new Promise((resolve) => {
     const child = spawn("vibe", args, { cwd, env: vibeEnv(model, compactAt, effortEntry), stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: !IS_WIN });
@@ -300,68 +358,140 @@ function runVibe({ cwd, dir, job, prompt, write, resumeId, model, maxTurns, time
     saveJob(dir, job);
     let stdout = "", stderr = "", hung = false, sid = resumeId || null;
     const before = new Set(listSessionIds());
-    const poll = setInterval(() => {
-      if (!sid) sid = findSessionId(before, cwd);
-      const act = sid && journalActivity(sid);
-      if (!act) return;
-      try { // update only this field on the fresh record so a concurrent cancel is not overwritten
+    const p = { turn: 0, maxTurns: maxTurns || null, tokens: null, last: null, notes: [] };
+    let tail = resumeId ? journalTail(resumeId, journalSizes(resumeId)) : null;
+    const pump = () => {
+      if (!tail) { sid = findSessionId(before, cwd); if (sid) tail = journalTail(sid); }
+      if (!tail) return;
+      const fwd = cwd.replace(/\\/g, "/"); // Vibe's tools show the folder as C:\x, C:/x or /c/x
+      const root = [cwd, fwd, fwd.replace(/^([A-Za-z]):/, (_, d) => `/${d.toLowerCase()}`)];
+      const lines = foldJournal(p, tail()).map((l) => (tag ? `wrap-up ${l}` : l)).map((l) => root.reduce((a, r) => a.split(r).join("."), l));
+      appendLog(job.logFile, lines);
+      try { // update only these fields on the fresh record so a concurrent cancel is not overwritten
         const cur = JSON.parse(fs.readFileSync(jobFile(dir, job.id), "utf8"));
-        if (cur.status === "running" && JSON.stringify(cur.lastActivity) !== JSON.stringify(act)) { cur.lastActivity = act; saveJob(dir, cur); }
+        if (cur.status !== "running") return;
+        const progress = { phase: tag ? "wrap-up" : "main", turn: p.turn, maxTurns: p.maxTurns, tokens: p.tokens };
+        const act = lines.length ? { label: p.last, at: new Date().toISOString() } : cur.lastActivity;
+        if (JSON.stringify(cur.progress) === JSON.stringify(progress) && cur.lastActivity === act) return;
+        cur.progress = progress; cur.lastActivity = act; cur.sessionId = cur.sessionId || sid;
+        saveJob(dir, cur);
       } catch {}
-    }, ACTIVITY_POLL_MS);
-    const guard = setTimeout(() => {
+    };
+    const poll = setInterval(pump, ACTIVITY_POLL_MS);
+    const guard = timeLimit ? setTimeout(() => {
       hung = true;
-      const act = sid && journalActivity(sid);
       stderr += `Vibe did not exit within ${HANG_GRACE_S}s of its ${timeLimit}s time limit and was killed.` +
-        (act ? ` Last journal activity: ${act.label} at ${act.at}.` : "") + (sid ? ` Session: ${sid}.` : "") + "\n"
+        (p.last ? ` Last action: ${p.last}.` : "") + (sid ? ` Session: ${sid}.` : "") + "\n";
       killTree(child.pid, { group: !IS_WIN });
-    }, (timeLimit + HANG_GRACE_S) * 1000);
+    }, (timeLimit + HANG_GRACE_S) * 1000) : null;
+    const done = () => { clearInterval(poll); if (guard) clearTimeout(guard); try { pump(); } catch {} };
     child.stdout.setEncoding("utf8").on("data", (d) => (stdout += d));
     child.stderr.setEncoding("utf8").on("data", (d) => (stderr += d));
-    child.on("error", (e) => { clearInterval(poll); clearTimeout(guard); resolve({ code: -1, stdout, stderr: String(e.message), exp: null }); });
+    child.on("error", (e) => { done(); resolve({ code: -1, stdout, stderr: String(e.message), exp: null, progress: p, sid }); });
     child.on("close", (code) => {
-      clearInterval(poll); clearTimeout(guard);
+      done();
       let exp = null;
       try { exp = JSON.parse(fs.readFileSync(path.join(outDir, "export.json"), "utf8")); } catch {}
-      resolve({ code: hung ? -1 : code, stdout, stderr, exp });
+      resolve({ code: hung ? -1 : code, stdout, stderr, exp, progress: p, sid: exp?.session_id || sid });
     });
   });
 }
 
-async function runJob({ kind, title, cwd, prompt, write = false, resumeId = null, model = null, maxTurns, timeLimit, json, brief = false, compactAt, effort }) {
+// When the caller sets a turn or time limit, the main run gets slightly less, and if it hits the limit
+// the session is resumed with the reserve and told to wrap up (revert debug edits, write what it found).
+function wrapReserve(maxTurns, timeLimit) {
+  const turns = maxTurns ? (maxTurns >= 10 ? Math.min(8, Math.max(3, Math.round(maxTurns * 0.05))) : 0) : (timeLimit ? 5 : 0);
+  const secs = timeLimit && timeLimit >= 300 ? Math.min(300, Math.max(60, Math.round(timeLimit * 0.1))) : 0;
+  return { turns, secs: timeLimit ? secs : 0, ok: turns > 0 && (!timeLimit || secs > 0) };
+}
+const LIMIT_NAMES = { turn_limit: "turn limit", deadline: "time limit", token_limit: "token limit", price_limit: "price limit",
+  length: "output length limit", refusal: "model refusal", terminated: "termination signal" };
+function wrapPrompt(kind, outcome, turns, write) {
+  const what = LIMIT_NAMES[outcome] || "limit";
+  if (kind === "task" && !write) return `You reached this run's ${what}. You now have at most ${turns} more turns. Do not investigate further and do not try to edit files (this run is read-only). Reply now with a short report: what you found (including the most likely root cause, if you have one), what is unfinished, and the next step you would take.`;
+  return kind === "task"
+    ? `You reached this run's ${what}. You now have at most ${turns} more turns, only to wrap up. Do not investigate further.\n` +
+      "1. Revert any temporary edits you made for debugging (debug logging, commented-out code, scratch files).\n" +
+      "2. If your instructions asked for a report or notes file, write it now with what you found.\n" +
+      "3. Then reply with a short report: what you found (including the most likely root cause, if you have one), what you changed, what is unfinished, and the next step you would take."
+    : `You reached this run's ${what}. You now have at most ${turns} more turns. Do not explore further: reply now with your findings so far, in the format you were asked for, and say which parts you did not get to.`;
+}
+function sumUsage(list) {
+  const u = list.filter(Boolean);
+  if (!u.length) return null;
+  const s = {};
+  for (const x of u) for (const [k, v] of Object.entries(x)) if (typeof v === "number") s[k] = (s[k] || 0) + v;
+  return s;
+}
+
+async function runJob({ kind, title, cwd, prompt, write = false, resumeId = null, model = null, maxTurns = null, timeLimit = null, maxTokens = null,
+  json, brief = false, compactAt, effort, wrapUp = true, resumedFrom = null }) {
   const eff = resolveEffort(model, effort);
   if (eff.error) { console.error(eff.error); return 1; }
   if (eff.note) console.error(eff.note);
   const dir = stateDir(cwd);
+  const id = `${kind}-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
   const job = {
-    id: `${kind}-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`,
-    kind, title, write, brief, status: "running", cwd,
+    id, kind, title, write, brief, status: "running", cwd,
     claudeSession: sessionKey(), companionPid: process.pid,
     createdAt: new Date().toISOString(),
+    model: model || null, effort: effort || null, compactAt: compactAt || null, resumedFrom,
+    limits: { maxTurns: maxTurns || null, timeLimit: timeLimit || null, maxTokens: maxTokens || null },
+    logFile: path.join(dir, `${id}.log`),
   };
+  fs.writeFileSync(job.logFile, "", "utf8");
   saveJob(dir, job);
   pruneJobs(dir);
   const onSig = () => { killTree(job.vibePid, { group: true }); job.status = "cancelled"; saveJob(dir, job); process.exit(130); };
   process.on("SIGTERM", onSig); process.on("SIGINT", onSig);
+  const cancelled = () => { try { return JSON.parse(fs.readFileSync(jobFile(dir, id), "utf8")).status === "cancelled"; } catch { return false; } };
+  // runVibe saves `job`; refresh it from disk first so progress fields written by the poller survive.
+  const reload = () => { try { Object.assign(job, JSON.parse(fs.readFileSync(jobFile(dir, id), "utf8"))); } catch {} };
 
-  const r = await runVibe({ cwd, dir, job, prompt, write, resumeId, model, compactAt, effortEntry: eff.entry,
-    maxTurns: maxTurns || DEFAULT_MAX_TURNS, timeLimit: timeLimit || DEFAULT_TIME_LIMIT });
+  const reserve = wrapUp ? wrapReserve(maxTurns, timeLimit) : { turns: 0, secs: 0, ok: false };
+  const t0 = Date.now();
+  appendLog(job.logFile, [`start · ${write ? "write" : "read-only"}${model ? ` · ${model}` : ""}${maxTurns ? ` · max ${maxTurns} turns` : ""}${timeLimit ? ` · ${timeLimit}s` : ""}${reserve.ok ? ` · ${reserve.turns} turns kept for wrap-up` : ""}`]);
+  const common = { cwd, dir, job, write, model, compactAt, effortEntry: eff.entry, maxTokens };
+  const r1 = await runVibe({ ...common, prompt, resumeId,
+    maxTurns: maxTurns ? (reserve.ok ? maxTurns - reserve.turns : maxTurns) : null,
+    timeLimit: timeLimit ? (reserve.ok ? timeLimit - reserve.secs : timeLimit) : null });
+  if (cancelled()) { console.log(`${id} was cancelled.`); return 1; }
+  const out1 = r1.exp?.outcome || null;
+  const sid = r1.sid || null;
+  let r2 = null;
+  if (reserve.ok && sid && (out1 === "turn_limit" || out1 === "deadline")) {
+    const left = timeLimit ? Math.max(60, Math.floor(timeLimit - (Date.now() - t0) / 1000)) : null;
+    appendLog(job.logFile, [`stopped at the ${LIMIT_NAMES[out1]} · resuming for wrap-up (${reserve.turns} turns)`]);
+    reload();
+    r2 = await runVibe({ ...common, tag: ".wrap", prompt: wrapPrompt(kind, out1, reserve.turns, write), resumeId: sid,
+      maxTurns: reserve.turns, timeLimit: out1 === "deadline" ? reserve.secs : left });
+    if (cancelled()) { console.log(`${id} was cancelled.`); return 1; }
+  }
+  reload();
 
-  const fresh = (() => { try { return JSON.parse(fs.readFileSync(jobFile(dir, job.id), "utf8")); } catch { return job; } })();
-  if (fresh.status === "cancelled") { console.log(`${job.id} was cancelled.`); return 1; }
-
-  const exp = r.exp;
-  job.sessionId = exp?.session_id || null;
-  job.usage = exp?.usage || null;
-  job.costUsd = exp?.cost_usd ?? null;
-  job.stopReason = exp?.stop_reason || null;
-  job.exitCode = r.code;
-  job.output = r.stdout.trim();
-  job.stderr = r.stderr.trim().split(/\r?\n/).filter((l) => !/^Reading API keys from the system keyring/.test(l)).join("\n");
-  job.status = classifyOutcome({ code: r.code, outcome: exp?.outcome, stopReason: job.stopReason, hasOutput: !!job.output });
-  if (job.status === "failed") job.error = exp?.error || job.stderr || `vibe exited with code ${r.code}`;
+  const exps = [r1.exp, r2?.exp].filter(Boolean);
+  job.sessionId = sid;
+  job.usage = sumUsage(exps.map((e) => e.usage));
+  job.costUsd = exps.some((e) => e.cost_usd != null) ? exps.reduce((a, e) => a + (e.cost_usd || 0), 0) : null;
+  job.turns = exps.reduce((a, e) => a + (Number(e.steps) || 0), 0) || r1.progress.turn + (r2?.progress.turn || 0) || null;
+  job.outcome = out1;
+  job.stopReason = r1.exp?.stop_reason || null;
+  job.wrapUp = r2 ? { turns: r2.exp?.steps ?? r2.progress.turn ?? null, reserve: reserve.turns, outcome: r2.exp?.outcome || null } : null;
+  job.durationS = Math.round((Date.now() - t0) / 1000);
+  job.exitCode = r1.code;
+  job.output = (r2?.stdout || "").trim() || r1.stdout.trim();
+  job.stderr = [r1.stderr, r2?.stderr].filter(Boolean).join("\n").trim().split(/\r?\n/).filter((l) => !/^Reading API keys from the system keyring/.test(l)).join("\n");
+  job.status = classifyOutcome({ code: r1.code, outcome: out1, stopReason: job.stopReason, hasOutput: !!job.output });
+  if (job.status === "failed") job.error = r1.exp?.error?.message || r1.exp?.error || job.stderr || `vibe exited with code ${r1.code}`;
+  // A run cut short usually ends mid-reasoning, with no final message; keep its last notes unless a wrap-up reported.
+  if (job.status === "partial" && !(r2?.exp?.outcome === "finished" && (r2.stdout || "").trim())) {
+    const notes = (r2?.progress.notes?.length ? r2.progress.notes : r1.progress.notes) || [];
+    const text = notes.map((n) => n.text).join("\n\n");
+    job.lastNotes = text ? (text.length > 2000 ? `…${text.slice(-2000)}` : text) : null;
+  }
   job.finishedAt = new Date().toISOString();
-  if (write && brief) job.diffStat = git(["diff", "--stat", "HEAD"], cwd).out.trim() || null;
+  if (write && brief) job.diffStat = git(["diff", "--stat", "HEAD"], cwd).out.replace(/^\s*\n/, "").trimEnd() || null;
+  appendLog(job.logFile, [`end · ${job.status}${out1 && out1 !== "finished" ? ` (${out1})` : ""} · ${job.turns ?? "?"} turns · ${job.usage?.total_tokens ?? "?"} tokens`]);
   saveJob(dir, job);
 
   if (json) console.log(JSON.stringify(job, null, 2));
@@ -378,20 +508,43 @@ function classifyOutcome({ code, outcome, stopReason, hasOutput }) {
   return hasOutput ? "completed" : "failed";
 }
 
+const fmtNum = (n) => (Number.isFinite(n) ? n.toLocaleString("en-US") : "?");
+function fmtDur(s) {
+  if (!Number.isFinite(s)) return "?";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = Math.round(s % 60);
+  return h ? `${h}h ${m}m` : m ? `${m}m ${r}s` : `${r}s`;
+}
+// "60 of 60 turns · 7m 1s of 30m · 2,917,392 tokens"
+function runFigures(job) {
+  const l = job.limits || {};
+  return [
+    job.turns != null ? `${job.turns}${l.maxTurns ? ` of ${l.maxTurns}` : ""} turns` : null,
+    job.durationS != null ? `${fmtDur(job.durationS)}${l.timeLimit ? ` of ${fmtDur(l.timeLimit)}` : ""}` : null,
+    job.usage?.total_tokens != null ? `${fmtNum(job.usage.total_tokens)}${l.maxTokens ? ` of ${fmtNum(l.maxTokens)}` : ""} tokens` : null,
+  ].filter(Boolean).join(" · ");
+}
+
 function renderResult(job) {
   const lines = [];
   if (job.status === "failed") {
     lines.push(`Mistral Vibe run failed (${job.id}).`, "", job.error || "Unknown error.");
   } else {
-    if (job.status === "partial")
-      lines.push(`> **Partial result:** the run stopped early (${job.stopReason || `exit ${job.exitCode}`}). Output below may be incomplete.`, "");
+    if (job.status === "partial") {
+      const why = LIMIT_NAMES[job.outcome] ? `stopped at the ${LIMIT_NAMES[job.outcome]}` : `stopped early (${job.outcome || job.stopReason || `exit ${job.exitCode}`})`;
+      lines.push(`> **Partial result:** the run ${why}${runFigures(job) ? ` (${runFigures(job)})` : ""}.`);
+      if (job.wrapUp) lines.push(`> It was then resumed to clean up and report, and used ${job.wrapUp.turns ?? "?"}${job.wrapUp.reserve ? ` of ${job.wrapUp.reserve}` : ""} wrap-up turns; the wrap-up ${job.wrapUp.outcome === "finished" ? "finished" : `also stopped (${LIMIT_NAMES[job.wrapUp.outcome] || job.wrapUp.outcome || "unknown"})`}.`);
+      if (job.kind === "task" && job.sessionId) lines.push(`> Continue it with \`/mistral:rescue --resume-job ${job.id}\` (a fresh turn allowance, same session).`);
+      lines.push("");
+    }
     const out = job.output || "(no output)";
     if (job.brief && out.length > BRIEF_PRINT_CHARS) {
       lines.push(out.slice(0, BRIEF_PRINT_CHARS), "", `[... output shortened (${out.length} chars); full text: /mistral:result ${job.id} --full]`);
     } else lines.push(out);
+    if (job.lastNotes) lines.push("", "**The agent's last reasoning** (it was cut off, so this may end mid-thought):", "", ...job.lastNotes.split("\n").map((l) => `> ${l}`));
     if (job.diffStat) lines.push("", "Changed files (git diff --stat HEAD):", "```", job.diffStat, "```");
   }
-  lines.push("", `_Job ${job.id}${job.sessionId ? ` · session ${job.sessionId}` : ""}${job.usage ? ` · ${job.usage.total_tokens} tokens` : ""}_`);
+  const figures = job.status === "partial" ? "" : runFigures(job);
+  lines.push("", `_Job ${job.id}${job.sessionId ? ` · session ${job.sessionId}` : ""}${figures ? ` · ${figures}` : job.usage && job.status !== "partial" ? ` · ${job.usage.total_tokens} tokens` : ""}_`);
   return lines.join("\n");
 }
 
@@ -469,7 +622,10 @@ function collectReviewContext(cwd, { scope, base }) {
 function loadPrompt(name) { return fs.readFileSync(path.join(ROOT, "prompts", `${name}.md`), "utf8"); }
 
 async function cmdReview(argv, adversarial) {
-  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["base", "scope", "model", "max-turns", "time-limit", "compact-at", "effort"], boolFlags: ["wait", "background", "json", "brief"] });
+  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["base", "scope", "model", "max-turns", "time-limit", "max-tokens", "compact-at", "effort"], boolFlags: ["wait", "background", "json", "brief", "no-wrap-up", "help"] });
+  if (opts.help) { console.log(adversarial ? ADVERSARIAL_HELP : REVIEW_HELP); return 0; }
+  const lim = parseLimits(opts);
+  if (lim.error) { console.error(lim.error); return 1; }
   const cwd = process.cwd();
   if (!git(["rev-parse", "--is-inside-work-tree"], cwd).ok) { console.error("Not inside a git repository."); return 1; }
   const ca = parseCompactAt(opts["compact-at"]);
@@ -487,35 +643,60 @@ async function cmdReview(argv, adversarial) {
     .replace("{{FOCUS}}", () => focus || "(none)")
     .replace("{{CONTEXT}}", () => ctx.body) + (opts.brief ? BRIEF_REVIEW_NOTE : "");
   return runJob({ kind: adversarial ? "adversarial-review" : "review", title: `${adversarial ? "Adversarial review" : "Review"}: ${ctx.target}`,
-    cwd, prompt, write: false, model: opts.model, maxTurns: num(opts["max-turns"]) || DEFAULT_REVIEW_TURNS, timeLimit: num(opts["time-limit"]), json: opts.json, brief: !!opts.brief, compactAt: ca.value, effort: ef.value });
+    cwd, prompt, write: false, model: opts.model, maxTurns: lim.maxTurns || DEFAULT_REVIEW_TURNS, timeLimit: lim.timeLimit || DEFAULT_REVIEW_TIME_LIMIT, maxTokens: lim.maxTokens,
+    json: opts.json, brief: !!opts.brief, compactAt: ca.value, effort: ef.value, wrapUp: !opts["no-wrap-up"] });
 }
 const BRIEF_REVIEW_NOTE = [
   "", "", "## Brevity (token budget)",
   "Report at most 7 findings, most severe first. One line each: `file:line — problem — fix`. No preamble, no praise, no restating the diff. If nothing material, reply `No material findings.`", "",
 ].join("\n");
-const num = (v) => (v === undefined ? undefined : Number(v));
+function parseLimits(opts) {
+  const out = {};
+  for (const [flag, key, min] of [["max-turns", "maxTurns", 1], ["time-limit", "timeLimit", 10], ["max-tokens", "maxTokens", 1000]]) {
+    const v = opts[flag];
+    if (v === undefined) continue;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < min) return { error: `--${flag} must be a whole number of at least ${min} (got ${JSON.stringify(v)}).` };
+    out[key] = n;
+  }
+  return out;
+}
 
 // ---------- task ----------
 async function cmdTask(argv) {
-  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["model", "max-turns", "time-limit", "compact-at", "effort"],
-    boolFlags: ["write", "resume-last", "fresh", "background", "wait", "json", "full"] });
+  const { opts, rest } = parseArgs(splitRaw(argv), { valueFlags: ["model", "max-turns", "time-limit", "max-tokens", "compact-at", "effort", "resume-job"],
+    boolFlags: ["write", "resume-last", "fresh", "background", "wait", "json", "full", "no-wrap-up", "help"] });
+  if (opts.help) { console.log(TASK_HELP); return 0; }
   const cwd = process.cwd();
+  const lim = parseLimits(opts);
+  if (lim.error) { console.error(lim.error); return 1; }
   const ca = parseCompactAt(opts["compact-at"]);
   if (ca.error) { console.error(ca.error); return 1; }
   const ef = parseEffort(opts.effort);
   if (ef.error) { console.error(ef.error); return 1; }
-  const task = rest.join(" ").trim();
-  if (!task) { console.error("Provide a task description."); return 1; }
-  let resumeId = null;
-  if (opts["resume-last"] && !opts.fresh) {
-    const cand = resumeCandidate(cwd);
-    if (!cand) { console.error("No previous Mistral task session to resume. Run without --resume-last."); return 1; }
-    resumeId = cand.sessionId;
+  let task = rest.join(" ").trim();
+  // A resumed session keeps its model, so inherit the model, effort and compaction of the job it came from.
+  let from = null;
+  if (opts["resume-job"]) {
+    const j = findJob(stateDir(cwd), opts["resume-job"]);
+    if (j === "ambiguous" || !j) { console.error(j ? `Ambiguous job id: ${opts["resume-job"]}` : `No job matching ${opts["resume-job"]}.`); return 1; }
+    if (j.status === "running") { console.error(`${j.id} is still running.`); return 1; }
+    if (!j.sessionId) { console.error(`${j.id} has no Vibe session id, so it cannot be continued.`); return 1; }
+    from = j;
+    if (!task) task = CONTINUE_PROMPT;
+  } else if (opts["resume-last"] && !opts.fresh) {
+    from = resumeCandidate(cwd);
+    if (!from) { console.error("No previous Mistral task session to resume. Run without --resume-last."); return 1; }
   }
+  if (!task) { console.error("Provide a task description."); return 1; }
+  if (from && opts.model && opts.model !== from.model) console.error(`Note: a resumed session keeps its model${from.model ? ` (${from.model})` : ""}; --model ${opts.model} is ignored.`);
   const prompt = opts.full ? task : task + BRIEF_TASK_NOTE;
-  return runJob({ kind: "task", title: task.slice(0, 80), cwd, prompt, write: !!opts.write, resumeId,
-    model: opts.model, maxTurns: num(opts["max-turns"]), timeLimit: num(opts["time-limit"]), json: opts.json, brief: !opts.full, compactAt: ca.value, effort: ef.value });
+  return runJob({ kind: "task", title: (from && task === CONTINUE_PROMPT ? `Continue ${from.id}: ${from.title}` : task).slice(0, 80), cwd, prompt,
+    write: !!opts.write || !!(opts["resume-job"] && from?.write), resumeId: from?.sessionId || null, resumedFrom: from?.id || null,
+    model: from ? from.model || null : opts.model, maxTurns: lim.maxTurns, timeLimit: lim.timeLimit, maxTokens: lim.maxTokens,
+    json: opts.json, brief: !opts.full, compactAt: ca.value ?? from?.compactAt ?? undefined, effort: ef.value ?? from?.effort ?? undefined, wrapUp: !opts["no-wrap-up"] });
 }
+const CONTINUE_PROMPT = "Continue the task from where you stopped. First check the current state of the files you were working on, then finish the remaining work.";
 const BRIEF_TASK_NOTE = "\n\n(Token budget: when finished, reply with a short summary only — what you changed and why, under 150 words. Do not paste code or diffs.)";
 function resumeCandidate(cwd) {
   const dir = stateDir(cwd);
@@ -560,10 +741,7 @@ async function cmdStatus(argv) {
       }
     }
     if (opts.json) console.log(JSON.stringify(j, null, 2));
-    else console.log([`Job ${j.id}`, `Kind: ${j.kind}`, `Status: ${j.status}`, `Elapsed: ${elapsed(j)}`, `Title: ${j.title}`,
-      j.status === "running" && j.lastActivity ? `Last activity: ${j.lastActivity.label} (${Math.max(0, Math.round((Date.now() - Date.parse(j.lastActivity.at)) / 1000))}s ago)` : null,
-      j.sessionId ? `Session: ${j.sessionId}` : null, j.stopReason ? `Stop reason: ${j.stopReason}` : null, j.error ? `Error: ${j.error}` : null,
-      j.status === "running" ? `Cancel: /mistral:cancel ${j.id}` : `Result: /mistral:result ${j.id}`].filter(Boolean).join("\n"));
+    else console.log(renderStatus(j));
     return 0;
   }
   const key = sessionKey();
@@ -572,8 +750,34 @@ async function cmdStatus(argv) {
   if (opts.json) { console.log(JSON.stringify(jobs, null, 2)); return 0; }
   if (!jobs.length) { console.log("No Mistral jobs recorded for this repository yet."); return 0; }
   console.log(["| Job | Kind | Status | Elapsed | Summary | Follow-up |", "|---|---|---|---|---|---|",
-    ...jobs.slice(0, 15).map((j) => `| ${j.id} | ${j.kind} | ${j.status} | ${elapsed(j)} | ${j.title.replace(/\|/g, "\\|")} | ${j.status === "running" ? `/mistral:cancel ${j.id}` : `/mistral:result ${j.id}`} |`)].join("\n"));
+    ...jobs.slice(0, 15).map((j) => `| ${j.id} | ${j.kind} | ${j.status} | ${j.status === "running" && j.progress?.turn ? `${elapsed(j)} · turn ${j.progress.turn}` : elapsed(j)} | ${j.title.replace(/\|/g, "\\|")} | ${j.status === "running" ? `/mistral:cancel ${j.id}` : `/mistral:result ${j.id}`} |`)].join("\n"));
   return 0;
+}
+
+function progressLine(j) {
+  const p = j.progress || {}, l = j.limits || {};
+  const max = p.maxTurns && p.maxTurns < 1000 ? p.maxTurns : l.maxTurns; // 1000 is Vibe's internal cap, not a limit someone set
+  return [p.turn ? `turn ${p.turn}${max ? ` of ${max}` : ""}${p.phase === "wrap-up" ? " (wrap-up)" : ""}` : null,
+    `${elapsed(j)}${l.timeLimit ? ` of ${fmtDur(l.timeLimit)}` : ""}`,
+    p.tokens != null ? `${fmtNum(p.tokens)} tokens in the session` : null].filter(Boolean).join(" · ");
+}
+function logTail(j, n = 5) {
+  try { return fs.readFileSync(j.logFile, "utf8").trimEnd().split(/\r?\n/).filter(Boolean).slice(-n); } catch { return []; }
+}
+function renderStatus(j) {
+  const running = j.status === "running";
+  const out = [`Job ${j.id}`, `Kind: ${j.kind}${j.write ? " (write)" : ""}`, `Status: ${j.status}${j.outcome && j.outcome !== "finished" ? ` (${LIMIT_NAMES[j.outcome] || j.outcome})` : ""}`, `Title: ${j.title}`,
+    running ? `Progress: ${progressLine(j)}` : runFigures(j) ? `Run: ${runFigures(j)}` : `Elapsed: ${elapsed(j)}`,
+    running && j.lastActivity ? `Last activity: ${j.lastActivity.label} (${Math.max(0, Math.round((Date.now() - Date.parse(j.lastActivity.at)) / 1000))}s ago)` : null,
+    j.model ? `Model: ${j.model}${j.effort ? ` · effort ${j.effort}` : ""}` : null,
+    j.resumedFrom ? `Continues: ${j.resumedFrom}` : null,
+    j.sessionId ? `Session: ${j.sessionId}` : null, j.error ? `Error: ${j.error}` : null];
+  const tail = logTail(j);
+  if (tail.length) out.push("", "Recent actions:", ...tail.map((l) => `  ${l}`));
+  if (j.logFile) out.push(`Log: ${j.logFile}`);
+  out.push(running ? `Cancel: /mistral:cancel ${j.id}` : `Result: /mistral:result ${j.id}`);
+  if (!running && j.status === "partial" && j.kind === "task" && j.sessionId) out.push(`Continue: /mistral:rescue --resume-job ${j.id}`);
+  return out.filter((x) => x !== null).join("\n");
 }
 
 function cmdResult(argv) {
@@ -688,7 +892,46 @@ function cmdSetup(argv) {
   return 0;
 }
 
-export { gitStallFix, parseEffort,resolveEffort, parseCompactAt, vibeEnv, deepseekEntry, NOISE_RE, renderResult, classifyOutcome, splitRaw, parseArgs, collectReviewContext, listJobs, saveJob, pruneJobs, findJob, pidIsOurs, MAX_JOBS };
+export { foldJournal, journalTail, wrapReserve, parseLimits, renderStatus, runFigures, gitStallFix, parseEffort,resolveEffort, parseCompactAt, vibeEnv, deepseekEntry, NOISE_RE, renderResult, classifyOutcome, splitRaw, parseArgs, collectReviewContext, listJobs, saveJob, pruneJobs, findJob, pidIsOurs, MAX_JOBS };
+
+// ---------- help ----------
+const LIMIT_HELP = `Limits (opt-in for tasks):
+  --max-turns <n>     stop after n turns. A turn is one model call; tool calls and hooks are not turns.
+  --time-limit <s>    stop after s seconds.
+  --max-tokens <n>    stop when the run has used n tokens (input + output, cached input included).
+  --no-wrap-up        with a turn or time limit, the plugin normally keeps a few turns (3-8, about 5%)
+                      and up to 5 minutes (about 10%) in reserve. If the run hits the limit, it resumes
+                      the session with that reserve and tells the agent to revert debug edits, write any
+                      report it was asked for, and summarize. This flag turns that off.`;
+const TASK_HELP = `Usage: task [options] <task text>
+
+Hands a task to Mistral Vibe. By default a task has no turn, time or token limit: it runs until the
+agent finishes, like a subagent (Vibe's own internal cap is 1000 turns). Progress is written one
+line per action to <job>.log; /mistral:status <job> shows it with the turn count and tokens.
+
+Options:
+  --write             let Vibe edit files and run commands (--auto-approve). Without it, read-only.
+  --model <alias>     Vibe model alias, e.g. deepseek@mistral. New sessions only.
+  --effort <level>    off|low|medium|high|xhigh|max (DeepSeek defaults to max).
+  --compact-at <n>    token count at which Vibe compacts the session.
+  --resume-job <id>   continue the Vibe session of an earlier job (for example one that stopped at a
+                      limit) with a fresh allowance. Inherits its model, effort, compaction and write
+                      mode. The task text is optional; the default asks the agent to carry on.
+  --resume-last       continue the most recent task session in this repo; --fresh forces a new one.
+  --full              return the agent's full reply instead of a short summary.
+  --json              print the job record as JSON.
+
+${LIMIT_HELP}`;
+const REVIEW_HELP = `Usage: review [options]
+
+Read-only review of the working tree or a branch diff. Defaults: ${DEFAULT_REVIEW_TURNS} turns and ${DEFAULT_REVIEW_TIME_LIMIT} seconds.
+
+Options:
+  --scope auto|working-tree|branch   --base <ref>   --model <alias>   --effort <level>
+  --compact-at <n>   --brief   --json
+
+${LIMIT_HELP}`;
+const ADVERSARIAL_HELP = REVIEW_HELP.replace("Usage: review [options]", "Usage: adversarial-review [options] [focus text]");
 
 // ---------- main ----------
 // Compare real paths: Node resolves the entry point's realpath, so symlinks or Windows case

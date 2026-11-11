@@ -211,4 +211,70 @@ test("gitStallFix adds stdin=DEVNULL to _git_eol only, keeping CRLF", () => {
   assert.equal(m.gitStallFix("def other():\n    pass\n").state, "unknown");
 });
 
+test("foldJournal counts turns, tokens, actions and keeps the last notes", () => {
+  const p = { turn: 0, notes: [] };
+  const lines = m.foldJournal(p, [
+    { type: "action_intent", payload: { kind: "completion", request: { iteration: 0, max_iterations: 12 } } },
+    { type: "action_intent", payload: { kind: "tool", request: { call: { name: "bash", arguments: { command: "npm test\n  -- --grep x" } } } } },
+    { type: "action_intent", payload: { kind: "hook", request: {} } },
+    { type: "action_intent", payload: { kind: "completion", request: { iteration: 1, max_iterations: 12 } } },
+    { type: "action_intent", payload: { kind: "filesystem", request: { call: { name: "file_system.read_file", arguments: { path: "src/a.ts" } } } } },
+    { type: "projection_delta", payload: { delta: [
+      { op: "set_envelope", state: { session: { tokenUsage: { totalTokens: 4321 } } } },
+      { op: "append_entry", entry: { id: "r1", type: "reasoning", text: "first idea" } },
+      { op: "replace_entry", entry: { id: "r1", type: "reasoning", text: "first idea, refined" } },
+      { op: "append_entry", entry: { id: "u1", type: "message", role: "user", content: [{ text: "ignored" }] } },
+      { op: "append_entry", entry: { id: "a1", type: "message", role: "assistant", content: [{ text: "Done so far" }] } },
+    ] } },
+  ]);
+  assert.deepEqual(lines, ["turn 1 · bash · npm test -- --grep x", "turn 2 · file_system.read_file · src/a.ts"]);
+  assert.equal(p.turn, 2); assert.equal(p.maxTurns, 12); assert.equal(p.tokens, 4321);
+  assert.deepEqual(p.notes.map((n) => n.text), ["first idea, refined", "Done so far"]);
+});
+
+test("journalTail reads new complete lines across segments, including a partial last line", () => {
+  const sid = "sess-tail";
+  process.env.VIBE_HOME = path.join(tmp, "vibehome");
+  const jd = path.join(tmp, "vibehome", "logs", "session", "unified", sid, "journal");
+  fs.mkdirSync(jd, { recursive: true });
+  fs.writeFileSync(path.join(jd, "0001.jsonl"), '{"a":1}\n{"a":2');
+  const read = m.journalTail(sid);
+  assert.deepEqual(read(), [{ a: 1 }]);
+  fs.appendFileSync(path.join(jd, "0001.jsonl"), '}\n');
+  fs.writeFileSync(path.join(jd, "0002.jsonl"), "");
+  assert.deepEqual(read(), [{ a: 2 }]);
+  fs.writeFileSync(path.join(jd, "0002.jsonl"), '{"b":"ü"}\n');
+  assert.deepEqual(read(), [{ b: "ü" }]);
+  assert.deepEqual(read(), []);
+  delete process.env.VIBE_HOME;
+});
+
+test("wrapReserve and parseLimits", () => {
+  assert.deepEqual(m.wrapReserve(null, null), { turns: 0, secs: 0, ok: false });
+  assert.equal(m.wrapReserve(60, null).turns, 3);
+  assert.equal(m.wrapReserve(20, null).turns, 3);
+  assert.equal(m.wrapReserve(1000, null).turns, 8);
+  assert.equal(m.wrapReserve(5, null).ok, false);
+  assert.deepEqual(m.wrapReserve(null, 1800), { turns: 5, secs: 180, ok: true });
+  assert.equal(m.wrapReserve(null, 120).ok, false);
+  assert.deepEqual(m.parseLimits({ "max-turns": "40", "max-tokens": "500000" }), { maxTurns: 40, maxTokens: 500000 });
+  assert.match(m.parseLimits({ "time-limit": "5" }).error, /--time-limit/);
+});
+
+test("a partial result names the limit, shows the figures, last reasoning and how to continue", () => {
+  const out = m.renderResult({ id: "task-x", kind: "task", status: "partial", outcome: "turn_limit", sessionId: "s1", turns: 60,
+    durationS: 421, limits: { maxTurns: 60 }, usage: { total_tokens: 2917392 }, output: "I'll start.", lastNotes: "Looking at the parser\nnext: fix" });
+  assert.match(out, /stopped at the turn limit \(60 of 60 turns · 7m 1s · 2,917,392 tokens\)/);
+  assert.match(out, /--resume-job task-x/);
+  assert.match(out, /> Looking at the parser/);
+  const w = m.renderResult({ id: "t", kind: "task", status: "partial", outcome: "deadline", wrapUp: { turns: 3, outcome: "finished" }, output: "report" });
+  assert.match(w, /time limit/); assert.match(w, /wrap-up finished/);
+  assert.match(m.renderResult({ id: "t", status: "completed", output: "ok", turns: 4, durationS: 30, usage: { total_tokens: 99 } }), /4 turns · 30s · 99 tokens/);
+});
+
+test("task --help prints usage without running vibe", () => {
+  const r = spawnSync(process.execPath, [path.resolve("scripts/mistral-companion.mjs"), "task", "--help"], { encoding: "utf8", env: { ...process.env, PATH: "" } });
+  assert.equal(r.status, 0); assert.match(r.stdout, /--resume-job/); assert.match(r.stdout, /no turn, time or token limit/);
+});
+
 test("cleanup", () => { fs.rmSync(tmp, { recursive: true, force: true }); });

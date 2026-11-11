@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up work to the Mistral rescue subagent
-argument-hint: '[--background|--wait] [--resume|--fresh] [--model <alias>] [--effort <level>] [--compact-at <tokens>] [what Mistral should investigate, solve, or continue]'
+argument-hint: '[--background|--wait] [--resume|--fresh|--resume-job <job-id>] [--model <alias>] [--effort <level>] [--compact-at <tokens>] [--max-turns <n>] [--time-limit <s>] [--max-tokens <n>] [what Mistral should investigate, solve, or continue]'
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -13,8 +13,8 @@ $ARGUMENTS
 
 Execution mode:
 - `--background`: run the subagent in the background. `--wait` or neither: foreground.
-- `--background` and `--wait` are Claude Code execution flags; do not forward them as task text. `--model` is a runtime flag; preserve it for the forwarded `task` call.
-- With `--resume` or `--fresh`, do not ask; the user already chose.
+- `--background` and `--wait` are Claude Code execution flags; do not forward them as task text. `--model`, `--effort`, `--compact-at`, `--max-turns`, `--time-limit`, `--max-tokens`, `--no-wrap-up` and `--resume-job <id>` are runtime flags; preserve them for the forwarded `task` call.
+- With `--resume`, `--fresh` or `--resume-job`, do not ask; the user already chose.
 - Otherwise run:
 
 ```bash

@@ -40,6 +40,8 @@ It is a port of the idea behind [openai/codex-plugin-cc](https://github.com/open
 /mistral:adversarial-review --scope branch look for race conditions and retry storms
 /mistral:rescue --write investigate why the integration test is flaky
 /mistral:rescue --resume apply the top fix
+/mistral:rescue --resume-job task-mwchrgry-b7ac3f
+/mistral:rescue --write --max-turns 80 --time-limit 3600 fix the flaky login test
 /mistral:status
 /mistral:result
 ```
@@ -55,11 +57,15 @@ It is a port of the idea behind [openai/codex-plugin-cc](https://github.com/open
 
 ### Rescue options
 - `--resume` / `--fresh`: continue the last Vibe session for this repo, or start a new one.
+- `--resume-job <job-id>`: continue the Vibe session of a specific earlier job, for example one that stopped at a limit. It keeps that job's model, effort and write mode and gets a fresh allowance. The task text is optional; the default tells the agent to check where it was and finish.
+- `--max-turns <n>`, `--time-limit <seconds>`, `--max-tokens <n>`: opt-in limits (see [Turns and limits](#turns-and-limits)). `--no-wrap-up` turns off the wrap-up reserve.
 - `--model <alias>`: use a specific Vibe model alias.
 - `--effort <level>` and `--compact-at <tokens>`: see below.
 - `--background` / `--wait`: as above.
 
 Rescue runs go through the `mistral:mistral-rescue` subagent. Claude can also call that subagent on its own when it is stuck.
+
+`node scripts/mistral-companion.mjs task --help` (and `review --help`) lists every option with its default.
 
 ## Choosing a model
 
@@ -93,14 +99,30 @@ The defaults are tuned for using Vibe alongside Claude:
 - **No preliminary turns.** `/mistral:review` runs immediately; Claude does not run size estimates or ask a question first.
 - **Full reviews, short rescue replies.** Reviews return everything Mistral says; add `--brief` when you want only the top findings. Rescue runs reply with a short summary and a `git diff --stat` of what changed (printed output capped at about 4000 characters; `--full` on the command, or `/mistral:result <id> --full`, returns everything).
 - **Smaller review input.** Lockfiles, minified files, source maps and snapshots are left out of the diff, and the review input is capped at 100 KB.
-- **Fewer turns.** Reviews stop after 15 turns by default (`--max-turns` to change).
+- **Bounded reviews.** Reviews stop after 15 turns or 30 minutes by default (`--max-turns`, `--time-limit` to change). Tasks are not bounded by default; add `--max-tokens` to cap what one costs.
 - **Pick a cheaper model** for routine work with `--model`.
 
-## Stuck runs
+## Turns and limits
 
-While a job runs, the plugin watches Vibe's session journal and records the latest action. `/mistral:status <job-id>` shows it as `Last activity: <action> (<n>s ago)`, so you can tell a working run from a stuck one even though the output stays empty until the run ends. Vibe's `--time-limit` (default 1800 seconds) ends a stuck run. As a backstop, the plugin kills the Vibe process tree if it is still running 120 seconds after the limit, and reports the last journal activity and session id in the error.
+**Defaults.** A rescue task has no turn, time or token limit. It runs until the agent finishes, the way a Codex rescue or a Claude subagent does. Vibe's own internal cap of 1000 turns still applies. Reviews default to 15 turns and 1800 seconds.
 
-**Known Vibe issue (Windows):** a `write_file` that creates a *new* file stalls until the time limit when the folder is in a git repository with a `.gitattributes` file, or in a linked git worktree. The file is written only when the run ends. Vibe runs `git check-attr` to choose the new file's line ending, without closing stdin. In Vibe's app server that git process stalls before it starts, and the 5-second timeout cannot free it, because it kills only Git for Windows' `cmd\git.exe` launcher. Edits to existing files are not affected. `/mistral:setup` checks for this, and `/mistral:setup --fix-vibe` patches your installed Vibe: it adds `stdin=subprocess.DEVNULL` to that one git call and keeps the original as `_sandbox_helper.py.orig`. Updating Vibe undoes the patch, so run `/mistral:setup` again after an update. The check covers Vibe installed with `uv tool`; if setup cannot find the file, the stuck run ends at its time limit, and `/mistral:status` shows `Running file_system.write_file` with a growing age.
+**What a turn is.** One turn is one model call. Vibe counts it as `steps` in its export, and its session journal records each one as a `completion` with its iteration number. Tool calls, file reads and hooks run inside a turn and do not count. One turn can make several tool calls. We have not yet checked how compaction affects the count (whether its summarizing call is a turn).
+
+**Opt-in limits.** `--max-turns <n>`, `--time-limit <seconds>` and `--max-tokens <n>` are passed to Vibe. `--max-tokens` counts input and output tokens for the run, cached input included. Every turn resends the context, so the total grows fast on long runs.
+
+**Wrap-up.** When you set a turn or time limit, the plugin keeps a reserve: 5% of the turns (3 to 8), or 5 turns with only a time limit, and 10% of the time (1 to 5 minutes). The main run gets the limit minus the reserve. If it stops there, the plugin resumes the same session with the reserve and tells the agent to stop investigating, revert temporary debug edits, write any report it was asked for, and summarize. Limits below 10 turns or 300 seconds get no reserve. `--no-wrap-up` turns it off.
+
+**Partial results.** A run that stops at a limit is shown as **partial**. The header names the limit and shows turns used against the limit, time against the limit, and total tokens. If the run produced no final message, the result also shows the agent's last reasoning. That text was cut off, so it can end mid-thought. Continue the run with `/mistral:rescue --resume-job <job-id>`.
+
+## Progress and stuck runs
+
+Vibe prints nothing until a run ends, so the plugin follows Vibe's session journal while a job runs:
+
+- **Progress log.** One line per tool call goes to `<job-id>.log` in the job folder, for example `14:02:11 turn 7 · bash · npm test`.
+- **Status.** `/mistral:status <job-id>` shows the turn (and the limit, if set), the elapsed time, the session's token count, the last action and its age, and the last five log lines. You can tell a working run from a stuck one even though the output is empty until the end.
+- **Time limits.** With a `--time-limit`, Vibe ends the run at the limit, stuck or not. As a backstop, the plugin kills the Vibe process tree if it is still running 120 seconds after the limit, and reports the last action and session id in the error. Without a time limit, use `/mistral:cancel` to stop a stuck run.
+
+**Known Vibe issue (Windows):** a `write_file` that creates a *new* file stalls until the time limit when the folder is in a git repository with a `.gitattributes` file, or in a linked git worktree. The file is written only when the run ends. Vibe runs `git check-attr` to choose the new file's line ending, without closing stdin. In Vibe's app server that git process stalls before it starts, and the 5-second timeout cannot free it, because it kills only Git for Windows' `cmd\git.exe` launcher. Edits to existing files are not affected. `/mistral:setup` checks for this, and `/mistral:setup --fix-vibe` patches your installed Vibe: it adds `stdin=subprocess.DEVNULL` to that one git call and keeps the original as `_sandbox_helper.py.orig`. Updating Vibe undoes the patch, so run `/mistral:setup` again after an update. The check covers Vibe installed with `uv tool`; if setup cannot find the file, a stuck run ends only at its time limit (or when you cancel it), and `/mistral:status` shows `Running file_system.write_file` with a growing age.
 
 ## How it works
 
@@ -108,12 +130,18 @@ While a job runs, the plugin watches Vibe's session journal and records the late
 - **Rescue** runs use `vibe --auto-approve`, which lets Vibe edit files and run commands without asking. A headless run cannot answer approval prompts, so there is no in-between mode. Only use rescue in repositories where you are comfortable with that.
 - Prompts are passed with `--prompt-file`, so large diffs do not hit command-line limits.
 - Each run is recorded as a job under the plugin data directory (`~/.cache/mistral-companion` if run outside Claude Code). Stop reason, token usage and session id come from Vibe's `--output-dir` export.
-- Runs stopped by a turn or time limit are shown as **partial** instead of success. Tasks default to a 30 minute and 60 turn cap; reviews to 15 turns.
+- Runs stopped by a limit are shown as **partial** instead of success (see [Turns and limits](#turns-and-limits)).
+- If Vibe warns that the folder is untrusted, it ignored the project's `AGENTS.md`. Trust the folder in Vibe if the agent should follow it.
 - `/mistral:cancel` kills the whole Vibe process tree.
 
 ## Differences from the Codex plugin
+- Like Codex, rescue tasks have no turn or time limit by default. The opt-in limits and the wrap-up reserve are extras.
 - No stop-time review gate and no session transfer.
 - Reviews are returned as Markdown, not structured JSON, because Vibe has no output-schema option.
+
+## Old plugin versions
+
+Claude Code keeps every installed version of the plugin in `~/.claude/plugins/cache/mistral-vibe/mistral/<version>/`. Claude Code owns that folder, so the plugin does not delete anything in it. You can delete old version folders yourself when no open Claude Code session still uses them. Job records are kept separately and are not affected.
 
 ## Development
 

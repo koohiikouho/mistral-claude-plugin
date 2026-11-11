@@ -239,8 +239,8 @@ function parseCompactAt(raw) {
 
 // ---------- activity tracking (Vibe's session journal) ----------
 // A hung tool call leaves no output until the run ends, so poll the session journal and record the last
-// action and when it happened. Vibe also ignores --time-limit while a tool call hangs, so a hard watchdog
-// kills the process tree a grace period after the limit.
+// action and when it happened. Vibe's --time-limit does end a stuck run; the watchdog is only a backstop
+// that kills the process tree if Vibe has still not exited a grace period after the limit.
 const HANG_GRACE_S = Number(process.env.MISTRAL_HANG_GRACE_S) || 120; // env override is for testing the watchdog
 const ACTIVITY_POLL_MS = Number(process.env.MISTRAL_ACTIVITY_POLL_MS) || 10_000;
 function sessionRoot() { return path.join(process.env.VIBE_HOME || path.join(os.homedir(), ".vibe"), "logs", "session", "unified"); }
@@ -312,7 +312,7 @@ function runVibe({ cwd, dir, job, prompt, write, resumeId, model, maxTurns, time
     const guard = setTimeout(() => {
       hung = true;
       const act = sid && journalActivity(sid);
-      stderr += `Vibe did not exit within ${HANG_GRACE_S}s of its ${timeLimit}s time limit and was killed (likely a hung tool call).` +
+      stderr += `Vibe did not exit within ${HANG_GRACE_S}s of its ${timeLimit}s time limit and was killed.` +
         (act ? ` Last journal activity: ${act.label} at ${act.at}.` : "") + (sid ? ` Session: ${sid}.` : "") + "\n"
       killTree(child.pid, { group: !IS_WIN });
     }, (timeLimit + HANG_GRACE_S) * 1000);

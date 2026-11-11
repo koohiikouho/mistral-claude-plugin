@@ -98,7 +98,9 @@ The defaults are tuned for using Vibe alongside Claude:
 
 ## Stuck runs
 
-While a job runs, the plugin watches Vibe's session journal and records the latest action. `/mistral:status <job-id>` shows it as `Last activity: <action> (<n>s ago)`, so you can tell a working run from a stuck one even though the output stays empty until the run ends. Vibe's own `--time-limit` does not fire while a tool call hangs, so the plugin also kills the Vibe process tree 120 seconds after the time limit and reports the last journal activity and session id in the error.
+While a job runs, the plugin watches Vibe's session journal and records the latest action. `/mistral:status <job-id>` shows it as `Last activity: <action> (<n>s ago)`, so you can tell a working run from a stuck one even though the output stays empty until the run ends. Vibe's `--time-limit` (default 1800 seconds) ends a stuck run. As a backstop, the plugin kills the Vibe process tree if it is still running 120 seconds after the limit, and reports the last journal activity and session id in the error.
+
+**Known Vibe issue (Windows):** a `write_file` that creates a *new* file stalls until the time limit when the folder is in a git repository with a `.gitattributes` file, or in a linked git worktree. The file is written only when the run ends. Vibe runs `git check-attr` to choose the new file's line ending, without closing stdin. In Vibe's app server that git process stalls before it starts, and the 5-second timeout cannot free it, because it kills only Git for Windows' `cmd\git.exe` launcher. Edits to existing files are not affected. Until Vibe fixes it, a run that creates new files there will sit until its time limit; `/mistral:status` shows `Running file_system.write_file` with a growing age.
 
 ## How it works
 

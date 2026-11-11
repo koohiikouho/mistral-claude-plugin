@@ -150,4 +150,17 @@ test("brief output is capped and points to --full; diff stat is shown", () => {
   assert.ok(m.renderResult({ id: "j2", status: "completed", brief: false, output: long }).length > 9000);
 });
 
+test("--compact-at is validated and reaches the vibe environment", () => {
+  assert.deepEqual(m.parseCompactAt(undefined), { value: undefined });
+  assert.equal(m.parseCompactAt("50000").value, 50000);
+  for (const bad of ["abc", "0", "999", "1.5", "-5", "99999999999"]) assert.match(m.parseCompactAt(bad).error, /Invalid --compact-at/, bad);
+  assert.equal(m.vibeEnv("mistral-medium-3.5", 60000).VIBE_AUTO_COMPACT_THRESHOLD, "60000");
+  assert.equal(m.vibeEnv("mistral-medium-3.5").VIBE_AUTO_COMPACT_THRESHOLD, process.env.VIBE_AUTO_COMPACT_THRESHOLD);
+  const ds = m.vibeEnv("deepseek@mistral", 60000);
+  const e = JSON.parse(ds.VIBE_MODELS)[0];
+  assert.equal(e.auto_compact_threshold, 60000);
+  assert.equal(e.thinking, "max");
+  assert.equal(ds.VIBE_AUTO_COMPACT_THRESHOLD, "60000");
+});
+
 test("cleanup", () => { fs.rmSync(tmp, { recursive: true, force: true }); });

@@ -15,7 +15,7 @@ Forwarding rules:
 - Without an explicit `--background` or `--wait`: prefer foreground for small bounded requests; for complicated or open-ended work, run the Bash call in the background.
 - Do not inspect the repository, read files, grep, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work. Do not call `review`, `adversarial-review`, `status`, `result` or `cancel`.
 - Add `--write` (Vibe then runs with auto-approve and may edit files and run commands) unless the user explicitly wants read-only behavior or only diagnosis or research.
-- Leave `--model` unset unless the user names one; then pass it through.
+- Leave `--model` unset unless the user names one; then pass it through. Pass `--compact-at <tokens>` through only if the user gives it.
 - `--resume` means add `--resume-last`; `--fresh` means do not add it. If the user is clearly continuing prior work ("continue", "keep going", "dig deeper"), add `--resume-last` unless `--fresh` is present.
 - Do not include `--model`, `--resume`, `--fresh`, `--background` or `--wait` in the task text. Preserve the rest of the user's text as-is.
 - Return the command's stdout exactly as-is, with no commentary. If the Bash call fails, return nothing.

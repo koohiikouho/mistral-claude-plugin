@@ -170,12 +170,13 @@ function vibeEnv(model, compactAt, effortEntry) {
   const e = deepseekEntry(model);
   const env = { ...process.env };
   if (compactAt) env.VIBE_AUTO_COMPACT_THRESHOLD = String(compactAt);
-  const entry = e ? { ...e, thinking: "max" } : effortEntry ? { ...effortEntry } : null;
+  const entry = e ? { ...e, thinking: effortEntry?.thinking || "max" } : effortEntry ? { ...effortEntry } : null;
   if (entry) env.VIBE_MODELS = JSON.stringify([{ ...entry, ...(compactAt ? { auto_compact_threshold: compactAt } : {}) }]);
   return env;
 }
 
 // ---------- effort (Vibe's per-model "thinking" level) ----------
+const DEEPSEEK_LEVELS = ["off", "low", "medium", "high", "max"];
 const EFFORT_LEVELS = ["off", "low", "medium", "high", "xhigh", "max"];
 const MODEL_INFO_TTL_MS = 3600_000;
 function dataBase() {
@@ -210,16 +211,15 @@ function parseEffort(raw) {
 // Returns { entry?, note?, error? }. `info` is injectable for tests.
 function resolveEffort(model, effort, info) {
   if (!effort) return {};
-  if (deepseekEntry(model)) return { note: effort === "max" ? null : `DeepSeek always runs at max reasoning; ignoring --effort ${effort}.` };
+  const ds = deepseekEntry(model);
+  if (ds) { // DeepSeek defaults to max (see vibeEnv); an explicit level is honored without needing the probe
+    if (!DEEPSEEK_LEVELS.includes(effort)) return { error: `Model ${model} supports --effort: ${DEEPSEEK_LEVELS.join(", ")}. Got "${effort}".` };
+    return { entry: { ...ds, thinking: effort } };
+  }
   info = info === undefined ? loadModelInfo() : info;
   if (!info) return { error: "Could not read Vibe's model list to apply --effort. Check that `vibe` runs (try /mistral:setup)." };
   const alias = model || info.active;
   if (!alias) return { error: "--effort needs a specific model. Pass --model <alias> (or set active_model in ~/.vibe/config.toml)." };
-  if (/deepseek/i.test(alias)) { // any DeepSeek alias is forced to max, even one the plugin does not know by name
-    const known = info.models[alias];
-    const note = "DeepSeek always runs at max reasoning" + (effort === "max" ? "." : "; ignoring --effort " + effort + ".");
-    return known ? { entry: { name: known.name, provider: known.provider, alias, thinking: "max" }, note } : { note };
-  }
   const m = info.models[alias];
   if (!m) return { error: `Unknown model "${alias}" for --effort. Known models: ${Object.keys(info.models).join(", ") || "(none)"}.` };
   const levels = m.thinking_levels || [];

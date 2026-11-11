@@ -175,19 +175,18 @@ test("--effort is validated and resolved against the model's levels", () => {
   assert.match(m.resolveEffort(undefined, "low", info).error, /needs a specific model/);
   assert.match(m.resolveEffort("glm-5-3", "low", null).error, /Could not read/);
   assert.deepEqual(m.resolveEffort("glm-5-3", undefined, info), {});
-  assert.equal(m.resolveEffort("deepseek@mistral", "low", info).entry, undefined);
-  assert.match(m.resolveEffort("deepseek@mistral", "low", info).note, /always runs at max/);
-  const dsActive = m.resolveEffort(undefined, "low", { active: "deepseek@mistral", models: {} });
-  assert.equal(dsActive.entry, undefined); // alias unknown to the model list: note only
+  const dsLow = m.resolveEffort("deepseek@mistral", "low", info);
+  assert.equal(dsLow.entry.thinking, "low");
+  assert.match(m.resolveEffort("deepseek@mistral", "xhigh", info).error, /supports --effort: off, low, medium, high, max/);
   const dsKnown = m.resolveEffort(undefined, "low", { active: "deepseek-x@mistral", models: { "deepseek-x@mistral": { name: "ds-x", provider: "mistral", thinking_levels: ["off", "low", "max"] } } });
-  assert.equal(dsKnown.entry.thinking, "max");
+  assert.equal(dsKnown.entry.thinking, "low");
   assert.equal(dsKnown.entry.name, "ds-x");
-  assert.match(dsActive.note, /always runs at max/);
+  assert.equal(JSON.parse(m.vibeEnv("deepseek@mistral", undefined, dsLow.entry).VIBE_MODELS)[0].thinking, "low");
   const env = m.vibeEnv("glm-5-3", 50000, ok.entry);
   const e = JSON.parse(env.VIBE_MODELS)[0];
   assert.equal(e.thinking, "low");
   assert.equal(e.auto_compact_threshold, 50000);
-  assert.equal(m.vibeEnv("deepseek@mistral", undefined, ok.entry).VIBE_MODELS.includes('"thinking":"max"'), true);
+  assert.equal(m.vibeEnv("deepseek@mistral").VIBE_MODELS.includes('"thinking":"max"'), true);
 });
 
 test("cleanup", () => { fs.rmSync(tmp, { recursive: true, force: true }); });

@@ -70,11 +70,11 @@ The plugin passes `--model <alias>` straight to `vibe`, so any model alias Vibe 
 /mistral:review --model deepseek@mistral
 ```
 
-DeepSeek models (any alias containing `deepseek`) always run at **max reasoning**. Vibe has no flag for this, so the plugin sets it for that run only through the `VIBE_MODELS` environment variable; your config files are not touched. If you set `active_model` to a DeepSeek alias in `config.toml` and omit `--model`, pass `--model` anyway to get max reasoning.
+DeepSeek models (any alias containing `deepseek`) run at **max reasoning** by default; pass `--effort` to choose another level (`off|low|medium|high|max`). Vibe has no flag for this, so the plugin sets it for that run only through the `VIBE_MODELS` environment variable; your config files are not touched. If you set `active_model` to a DeepSeek alias in `config.toml` and omit `--model`, pass `--model` anyway to get max reasoning.
 
 ### Reasoning effort (`--effort`)
 
-`--effort <level>` sets the model's reasoning (Vibe calls it `thinking`) for one run: `off`, `low`, `medium`, `high`, `xhigh` or `max`. Each model supports its own subset, for example GLM-5.3 takes `low|high|max` and DeepSeek takes all of them. The plugin checks the level against the model and refuses an unsupported one up front instead of letting the API return an error. It needs to know the model, so pass `--model <alias>` unless `active_model` is set in your config. The first use runs one tiny probe call to read Vibe's model list (cached for an hour). DeepSeek is always forced to `max` and ignores `--effort`.
+`--effort <level>` sets the model's reasoning (Vibe calls it `thinking`) for one run: `off`, `low`, `medium`, `high`, `xhigh` or `max`. Each model supports its own subset, for example GLM-5.3 takes `low|high|max` and DeepSeek takes all of them. The plugin checks the level against the model and refuses an unsupported one up front instead of letting the API return an error. It needs to know the model, so pass `--model <alias>` unless `active_model` is set in your config. The first use runs one tiny probe call to read Vibe's model list (cached for an hour). DeepSeek defaults to `max` when `--effort` is omitted.
 
 ```
 /mistral:review --model glm-5-3 --effort low
